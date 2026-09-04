@@ -1,0 +1,11 @@
+# Inference engines on AMD (Sep 2026) — key findings
+- vLLM: ROCm/vllm fork RETIRED; upstream ROCm CI live Dec 29 2025, pass rate 37%->93% in 3 months. FP4 only gfx950 (MI350) not MI300X (#34641 crash). RDNA4 gfx1201 needed community tuning configs (#28649). TheRock/ROCm 7.14 packaging migration unresolved (#48826). Cluster of open ROCm spec-decode/MTP/MLA bugs (#55280 #55132 #54369 #53323 #53051).
+- AITER = load-bearing kernel lib behind vLLM+SGLang wins (MLA decode +17x, MHA prefill +14x, MoE +3x, GEMM +2x). ROCM_AITER_FA 2.7-4.4x vs legacy.
+- SGLang: first-class MI300X; Marlin/gptq_marlin/awq_marlin/gguf/modelopt fp8/fp4 quant kernels DO NOT work on AMD; consumer RDNA not targeted.
+- TensorRT-LLM: no AMD equivalent. FA3 no ROCm equivalent.
+- llama.cpp: HIP + Vulkan both official. Vulkan beats HIP on RDNA3 (+23% tg) and RDNA4 small/MoE (+35%); HIP wins large dense + prompt processing. Windows HIP builds weakest: missing hipblas.dll (#26996), DLL load 126 (#28009), SILENT WRONG OUTPUT on gfx1151 Strix Halo under HIP where Vulkan correct (#27556), decode slowdown >1K ctx gfx1151 (#27856), gfx1201 crash first matmul (#27670). rocWMMA FA lag on RDNA4 (#13110).
+- Ollama: fixed gfx allowlist; HSA_OVERRIDE hacks; experimental Vulkan 0.12.6 (Oct 2025) because ROCm list excluded RX 6600M/7600 etc. Community fork likelovewant/ollama-for-amd.
+- LM Studio: ROCm runtime crashes with Adrenalin 26.5.1 on 9070 XT (lmstudio-bug-tracker #1906).
+- ExLlamaV2/V3: NO ROCm (V3 to-do). mistral.rs: NO ROCm. LMDeploy TurboMind CUDA-only. TGI archived Mar 21 2026 -> use vLLM/SGLang. MLC-LLM nominal ROCm/Vulkan. ktransformers ROCm since Mar 2025. Aphrodite has amdpatch.sh.
+- Lemonade SDK (AMD-sponsored) wraps llama.cpp/whisper.cpp/sd.cpp/ORT-GenAI; targets ROCm, Vulkan, XDNA2 NPU.
+- AMD claims MI300X vs H200 DeepSeek-R1 SGLang: 128 vs 16 concurrent <50ms ITL. MLPerf table not independently verified.

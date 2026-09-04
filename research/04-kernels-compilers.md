@@ -1,0 +1,11 @@
+# Kernels & compilers on AMD (Sep 2026) — key findings
+- Triton AMD: OpenAI+AMD co-engineering (6GW deal); warp-spec/ping-pong/multi-stream still ROADMAP for AMD (PR #5622); no tcgen05/TMA analogue; gfx950 WMMA perf only ~Apr 2026; per-shape hand configs, not autotuned. Bugs #10256 (gfx950 MLA decode pass failure), #10008 (dot_scaled fp8_e8m0).
+- CK/CK-Tile: compile-time pain acknowledged by AMD (6.1.0 changelog); folded into ROCm/rocm-libraries super-repo (with hipBLASLt, rocBLAS, MIOpen). CK lacks RDNA3.
+- AITER: default in vLLM-ROCm + SGLang; many kernels HAND-WRITTEN ASSEMBLY (maintainability/portability liability). DeepSeek-R1 6,484->13,704 tok/s MI300X.
+- HipKittens (Stanford, Nov 2025, arXiv 2511.08083): ~500-line kernels BEAT AITER hand-asm on MI355X; PyTorch SDPA only ~24% of SOTA on MI355X; CDNA3/4 only, research code, not integrated into vLLM/SGLang.
+- ThunderKittens no AMD (#50). FA3 NOT ported to ROCm at all; FA2 CK backend breaks gfx1100 (#2452); aotriton mem-efficient FA requested gfx1100 (#16); vLLM force-disables Triton FA on navi31 (#4514).
+- FlashInfer: separate ROCm/flashinfer fork, missing sampling/norm kernels (#1678). xformers fork-and-patch. bitsandbytes: ROCm fork rocm_enabled_multi_backend, install gaps (#1608).
+- Quant: AWQ/GPTQ/Marlin ❌ on AMD in vLLM matrix (lose 2.6x/10.9x); GGUF + FP8 W8A8 OK. #31689 help-wanted.
+- Mamba/SSM: selective-scan CUDA-only optimized; LightOn wrote custom kernels; community mamba-amd/causal-conv1d-amd forks (#671).
+- Liger Kernel: ROCm backend PR #1297 OPEN (FlyDSL). TileLang: AMD "Supported" w/ MI300X CI, RDNA WMMA secondary. Mojo/MAX: runs on AMD (Gemma3-27B 26.1 QPS MI355X), thin docs. IREE/SHARK first-class (AMD MLPerf SDXL Apr 2025). TVM nominal. Halide: ZERO AMD backend. Helion: no ROCm documented.
+- TheRock = new modular build system, nightly ROCm+PyTorch/JAX builds, vehicle for Windows; Windows still "actively developing".

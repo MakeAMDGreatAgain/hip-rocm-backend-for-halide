@@ -1,0 +1,14 @@
+# Training frameworks on AMD (Sep 2026) — key findings
+- PyTorch core: first-class upstream; 289 open `module: rocm` issues. Windows wheels since Sep 24 2025 (ROCm 6.4.4), Nov 26 2025 (7.1.1). Native Windows ROCm CI still open RFC (#159520). Bugs: SDPA fails gfx1100 (#194498), expandable_segments NaN bf16 gfx1201 (#195202), RX 9060 XT capped ~8GB VRAM segfault (#184880), QR slow MI300X (#151066).
+- SDPA/FlashAttn: two-backend patchwork AOTriton (default, stopgap) + CK (merged Jan 2025, "makes me sad... temporary" per @malfet, not supported on RDNA). AOTriton unavailable gfx1151 Strix Halo (ROCm #5404). TheRock #1364 FA on gfx1151.
+- torch.compile: works; max-autotune 800s+ compile, negligible gain. Gluon Inductor backend CUDA-first (#188212).
+- FSDP2: RCCL collectives consume CUs -> contend with GEMM (structural gap vs NCCL/SHARP). AMD RFC SDMA all-gather +16% (#186601, June 2026). DeepSpeed RFC SDMA (#7884).
+- DeepSpeed: ROCm install docs absent (#7570), missing nccl.h (#7468), AIO added Feb 2025.
+- Megatron-LM: ROCm/Megatron-LM diverging fork (rocm_dev). AMD pushing Primus (AMD-AGI/Primus, v26.5) wrapping Megatron/TorchTitan/MaxText + Primus-Turbo kernels. torchtitan: AMD-AGI/torchtitan-amd fork; 2.77x DeepSeek-V3 (AITER attn +15%, FP8 GEMM +102%, grouped +60%); 96-97% scaling 128->1024 MI325X. NO head-to-head H100 numbers.
+- MLPerf Training: v5.0 (Jun 2025) first AMD entry, MI325X +8% vs H200 on Llama2-70B LoRA; v5.1 MI355X 10.18 min vs MI300X 27.95; 6.0 (mid-2026) 512-GPU FLUX.1.
+- Monarch ported to ROCm (Jul 2026) — needed rocm_compat Rust shim; no static libamdhip64.
+- Unsloth: OFFICIAL AMD support (late 2025/2026), 95 CI tests run WITHOUT physical AMD hardware (caveat). PR #4720.
+- Axolotl: real AMD support in third-party fork AI-DarwinLabs/axolotl; upstream docs admit xformers incompatible w/ ROCm, DeepSpeed didn't work, flash-attn manual patch. LLaMA-Factory Linux-only guides. TRL works via stack; "does TRL support AMD?" issue #2008.
+- JAX: ROCm/jax PJRT plugin lags releases; no py3.13 wheels for months (#28374); 45 ROCm-tagged jax issues mostly "Unsupported ROCm Tests" (linalg, pallas, RNN) — entire suites skipped.
+- TensorFlow-rocm: pip package abandoned (12+ months); fork ROCm/tensorflow-upstream sporadic.
+- Lightning: no AMD maintainer, inherits PyTorch gaps.

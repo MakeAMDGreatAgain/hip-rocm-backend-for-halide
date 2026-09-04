@@ -1,0 +1,631 @@
+From 0668fd4e19d1bcaca2c37ab356a2c473ff2cb83e Mon Sep 17 00:00:00 2001
+From: Oussama Benjelloun <benje.oussama@gmail.com>
+Date: Fri, 4 Sep 2026 14:25:02 +0200
+Subject: [PATCH 1/7] HIP: add DeviceAPI::HIP and hip/hip_gfx* target features
+
+Adds the Target/DeviceAPI plumbing for a native AMD GPU backend:
+features hip, hip_gfx90a, hip_gfx942, hip_gfx950, hip_gfx1030, hip_gfx1100,
+hip_gfx1151, hip_gfx1201 (HL_HIP_ARCH env override; JIT autodetect via
+halide_hip_compute_capability), DeviceAPI::HIP, JIT runtime kinds, runtime
+API exports, serialization enum, Python enums, and the user_context list
+entries for halide_hip_run / halide_hip_initialize_kernels.
+
+Co-authored-by: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python_bindings/halide-runtime/test/gpu.py    |   2 +-
+ .../halide/src/halide_/PyEnums.cpp            |   9 +
+ src/CodeGen_Internal.cpp                      |   2 +
+ src/Deserialization.cpp                       |   2 +
+ src/DeviceAPI.h                               |   2 +
+ src/DeviceInterface.cpp                       |   7 +
+ src/IRPrinter.cpp                             |   3 +
+ src/JITModule.cpp                             |  19 ++
+ src/Serialization.cpp                         |   2 +
+ src/Target.cpp                                | 168 ++++++++++++++++++
+ src/Target.h                                  |  23 ++-
+ src/halide_ir.fbs                             |   1 +
+ src/runtime/HalideRuntime.h                   |   8 +
+ src/runtime/runtime_api.cpp                   |  13 ++
+ test/correctness/target.cpp                   |   4 +
+ 15 files changed, 263 insertions(+), 2 deletions(-)
+
+diff --git a/python_bindings/halide-runtime/test/gpu.py b/python_bindings/halide-runtime/test/gpu.py
+index 9fe8d89..f1c315c 100644
+--- a/python_bindings/halide-runtime/test/gpu.py
++++ b/python_bindings/halide-runtime/test/gpu.py
+@@ -18,7 +18,7 @@ import halide.runtime as hlr
+ 
+ runtime_only = getattr(sys.modules["halide"], "__file__", None) is None
+ 
+-_GPU_FEATURES = ("metal", "opencl", "cuda", "vulkan", "webgpu")
++_GPU_FEATURES = ("metal", "opencl", "cuda", "hip", "vulkan", "webgpu")
+ 
+ 
+ def backend_of(target):
+diff --git a/python_bindings/halide/src/halide_/PyEnums.cpp b/python_bindings/halide/src/halide_/PyEnums.cpp
+index d6327ab..d0c7d3f 100644
+--- a/python_bindings/halide/src/halide_/PyEnums.cpp
++++ b/python_bindings/halide/src/halide_/PyEnums.cpp
+@@ -23,6 +23,7 @@ void define_enums(py::module &m) {
+         .value("Host", DeviceAPI::Host)
+         .value("Default_GPU", DeviceAPI::Default_GPU)
+         .value("CUDA", DeviceAPI::CUDA)
++        .value("HIP", DeviceAPI::HIP)
+         .value("Vulkan", DeviceAPI::Vulkan)
+         .value("OpenCL", DeviceAPI::OpenCL)
+         .value("Metal", DeviceAPI::Metal)
+@@ -244,6 +245,14 @@ void define_enums(py::module &m) {
+         .value("HLSL_SM67", Target::Feature::HLSL_SM67)
+         .value("HLSL_SM68", Target::Feature::HLSL_SM68)
+         .value("HLSL_SM69", Target::Feature::HLSL_SM69)
++        .value("HIP", Target::Feature::HIP)
++        .value("HIPGFX90A", Target::Feature::HIPGFX90A)
++        .value("HIPGFX942", Target::Feature::HIPGFX942)
++        .value("HIPGFX950", Target::Feature::HIPGFX950)
++        .value("HIPGFX1030", Target::Feature::HIPGFX1030)
++        .value("HIPGFX1100", Target::Feature::HIPGFX1100)
++        .value("HIPGFX1151", Target::Feature::HIPGFX1151)
++        .value("HIPGFX1201", Target::Feature::HIPGFX1201)
+         .value("FeatureEnd", Target::Feature::FeatureEnd);
+ 
+     py::enum_<halide_type_code_t>(m, "TypeCode")
+diff --git a/src/CodeGen_Internal.cpp b/src/CodeGen_Internal.cpp
+index 4202554..bed8fd7 100644
+--- a/src/CodeGen_Internal.cpp
++++ b/src/CodeGen_Internal.cpp
+@@ -63,6 +63,7 @@ bool function_takes_user_context(const std::string &name) {
+         "halide_memoization_cache_store",
+         "halide_memoization_cache_release",
+         "halide_cuda_run",
++        "halide_hip_run",
+         "halide_opencl_run",
+         "halide_metal_run",
+         "halide_d3d12compute_run",
+@@ -88,6 +89,7 @@ bool function_takes_user_context(const std::string &name) {
+         "halide_vtcm_malloc",
+         "halide_vtcm_free",
+         "halide_cuda_initialize_kernels",
++        "halide_hip_initialize_kernels",
+         "halide_opencl_initialize_kernels",
+         "halide_metal_initialize_kernels",
+         "halide_d3d12compute_initialize_kernels",
+diff --git a/src/Deserialization.cpp b/src/Deserialization.cpp
+index f7f8566..92e6471 100644
+--- a/src/Deserialization.cpp
++++ b/src/Deserialization.cpp
+@@ -260,6 +260,8 @@ DeviceAPI Deserializer::deserialize_device_api(Serialize::DeviceAPI device_api)
+         return DeviceAPI::WebGPU;
+     case Serialize::DeviceAPI::SMEStreaming:
+         return DeviceAPI::SMEStreaming;
++    case Serialize::DeviceAPI::HIP:
++        return DeviceAPI::HIP;
+     default:
+         user_error << "unknown device api " << (int)device_api << "\n";
+         return DeviceAPI::None;
+diff --git a/src/DeviceAPI.h b/src/DeviceAPI.h
+index b8a9a5e..f25bcf0 100644
+--- a/src/DeviceAPI.h
++++ b/src/DeviceAPI.h
+@@ -17,6 +17,7 @@ enum class DeviceAPI {
+     Host,
+     Default_GPU,
+     CUDA,
++    HIP,
+     OpenCL,
+     Metal,
+     Hexagon,
+@@ -33,6 +34,7 @@ const DeviceAPI all_device_apis[] = {DeviceAPI::None,
+                                      DeviceAPI::Host,
+                                      DeviceAPI::Default_GPU,
+                                      DeviceAPI::CUDA,
++                                     DeviceAPI::HIP,
+                                      DeviceAPI::OpenCL,
+                                      DeviceAPI::Metal,
+                                      DeviceAPI::Hexagon,
+diff --git a/src/DeviceInterface.cpp b/src/DeviceInterface.cpp
+index 34a5bb8..f00da6a 100644
+--- a/src/DeviceInterface.cpp
++++ b/src/DeviceInterface.cpp
+@@ -94,6 +94,8 @@ const halide_device_interface_t *get_device_interface_for_device_api(DeviceAPI d
+         name = "opencl";
+     } else if (d == DeviceAPI::CUDA) {
+         name = "cuda";
++    } else if (d == DeviceAPI::HIP) {
++        name = "hip";
+     } else if (d == DeviceAPI::Hexagon) {
+         name = "hexagon";
+     } else if (d == DeviceAPI::HexagonDma) {
+@@ -152,6 +154,8 @@ DeviceAPI get_default_device_api_for_target(const Target &target) {
+         return DeviceAPI::OpenCL;
+     } else if (target.has_feature(Target::CUDA)) {
+         return DeviceAPI::CUDA;
++    } else if (target.has_feature(Target::HIP)) {
++        return DeviceAPI::HIP;
+     } else if (target.arch != Target::Hexagon && target.has_feature(Target::HVX)) {
+         return DeviceAPI::Hexagon;
+     } else if (target.has_feature(Target::HexagonDma)) {
+@@ -178,6 +182,9 @@ Expr make_device_interface_call(DeviceAPI device_api, MemoryType memory_type) {
+     case DeviceAPI::CUDA:
+         interface_name = "halide_cuda_device_interface";
+         break;
++    case DeviceAPI::HIP:
++        interface_name = "halide_hip_device_interface";
++        break;
+     case DeviceAPI::OpenCL:
+         if (memory_type == MemoryType::GPUTexture) {
+             interface_name = "halide_opencl_image_device_interface";
+diff --git a/src/IRPrinter.cpp b/src/IRPrinter.cpp
+index b4ca72d..19d3dab 100644
+--- a/src/IRPrinter.cpp
++++ b/src/IRPrinter.cpp
+@@ -115,6 +115,9 @@ ostream &operator<<(ostream &out, const DeviceAPI &api) {
+     case DeviceAPI::CUDA:
+         out << "<CUDA>";
+         break;
++    case DeviceAPI::HIP:
++        out << "<HIP>";
++        break;
+     case DeviceAPI::OpenCL:
+         out << "<OpenCL>";
+         break;
+diff --git a/src/JITModule.cpp b/src/JITModule.cpp
+index a6dfc77..0b4da3d 100644
+--- a/src/JITModule.cpp
++++ b/src/JITModule.cpp
+@@ -880,6 +880,7 @@ enum RuntimeKind {
+     OpenCL,
+     Metal,
+     CUDA,
++    HIP,
+     Hexagon,
+     D3D12Compute,
+     Vulkan,
+@@ -887,6 +888,7 @@ enum RuntimeKind {
+     OpenCLDebug,
+     MetalDebug,
+     CUDADebug,
++    HIPDebug,
+     HexagonDebug,
+     D3D12ComputeDebug,
+     VulkanDebug,
+@@ -923,6 +925,7 @@ JITModule &make_module(llvm::Module *for_module, Target target,
+         one_gpu.set_feature(Target::OpenCL, false);
+         one_gpu.set_feature(Target::Metal, false);
+         one_gpu.set_feature(Target::CUDA, false);
++        one_gpu.set_feature(Target::HIP, false);
+         one_gpu.set_feature(Target::HVX, false);
+         one_gpu.set_feature(Target::D3D12Compute, false);
+         one_gpu.set_feature(Target::Vulkan, false);
+@@ -958,6 +961,15 @@ JITModule &make_module(llvm::Module *for_module, Target target,
+             one_gpu.set_feature(Target::CUDA);
+             module_name += "cuda";
+             break;
++        case HIPDebug:
++            one_gpu.set_feature(Target::Debug);
++            one_gpu.set_feature(Target::HIP);
++            module_name = "debug_hip";
++            break;
++        case HIP:
++            one_gpu.set_feature(Target::HIP);
++            module_name += "hip";
++            break;
+         case HexagonDebug:
+             one_gpu.set_feature(Target::Debug);
+             one_gpu.set_feature(Target::HVX);
+@@ -1165,6 +1177,13 @@ std::vector<JITModule> JITSharedRuntime::get(llvm::Module *for_module, const Tar
+             result.push_back(m);
+         }
+     }
++    if (target.has_feature(Target::HIP)) {
++        auto kind = target.has_feature(Target::Debug) ? HIPDebug : HIP;
++        JITModule m = make_module(for_module, target, kind, result, create);
++        if (m.compiled()) {
++            result.push_back(m);
++        }
++    }
+     if (target.has_feature(Target::HVX)) {
+         auto kind = target.has_feature(Target::Debug) ? HexagonDebug : Hexagon;
+         JITModule m = make_module(for_module, target, kind, result, create);
+diff --git a/src/Serialization.cpp b/src/Serialization.cpp
+index 2dd7bf4..3fb122a 100644
+--- a/src/Serialization.cpp
++++ b/src/Serialization.cpp
+@@ -230,6 +230,8 @@ Serialize::DeviceAPI Serializer::serialize_device_api(const DeviceAPI &device_ap
+         return Serialize::DeviceAPI::WebGPU;
+     case DeviceAPI::SMEStreaming:
+         return Serialize::DeviceAPI::SMEStreaming;
++    case DeviceAPI::HIP:
++        return Serialize::DeviceAPI::HIP;
+     default:
+         user_error << "Unsupported device API\n";
+         return Serialize::DeviceAPI::None;
+diff --git a/src/Target.cpp b/src/Target.cpp
+index b5c4458..622655e 100644
+--- a/src/Target.cpp
++++ b/src/Target.cpp
+@@ -428,6 +428,54 @@ Target::Feature get_host_cuda_capability(Target t) {
+     return cap;
+ }
+ 
++Target::Feature calculate_host_hip_arch(Target t) {
++    const auto *interface = get_device_interface_for_device_api(DeviceAPI::HIP, t);
++    internal_assert(interface->compute_capability);
++    int major, minor;
++    int err = interface->compute_capability(nullptr, &major, &minor);
++    if (err != 0) {
++        user_warning << "Failed to query the HIP device architecture (error " << err << "). "
++                     << "No hip_gfx* feature will be set; set HL_HIP_ARCH or add an "
++                     << "explicit hip_gfx* target feature.\n";
++        return Target::FeatureEnd;
++    }
++    // halide_hip_compute_capability() encodes the device's gfx id as
++    // major = gfx generation and minor = the low byte of the gfx id, i.e.
++    // gfx90a -> (9, 0x0a), gfx942 -> (9, 0x42), gfx950 -> (9, 0x50),
++    // gfx1030 -> (10, 0x30), gfx1100 -> (11, 0x00), gfx1151 -> (11, 0x51),
++    // gfx1201 -> (12, 0x01).
++    struct {
++        int major, minor;
++        Target::Feature feature;
++    } const known_archs[] = {
++        {9, 0x0a, Target::HIPGFX90A},
++        {9, 0x42, Target::HIPGFX942},
++        {9, 0x50, Target::HIPGFX950},
++        {10, 0x30, Target::HIPGFX1030},
++        {11, 0x00, Target::HIPGFX1100},
++        {11, 0x51, Target::HIPGFX1151},
++        {12, 0x01, Target::HIPGFX1201},
++    };
++    for (const auto &arch : known_archs) {
++        if (arch.major == major && arch.minor == minor) {
++            return arch.feature;
++        }
++    }
++    static const char *const hex_digits = "0123456789abcdef";
++    std::string name = "gfx" + std::to_string(major);
++    name += hex_digits[(minor >> 4) & 0xf];
++    name += hex_digits[minor & 0xf];
++    user_warning << "The host HIP device (" << name << ") does not correspond to a known "
++                 << "hip_gfx* target feature. Set HL_HIP_ARCH=" << name << " (or add a "
++                 << "hip_gfx* feature) to select the GPU architecture to compile for.\n";
++    return Target::FeatureEnd;
++}
++
++Target::Feature get_host_hip_arch(Target t) {
++    static Target::Feature arch = calculate_host_hip_arch(t);
++    return arch;
++}
++
+ Target::Feature calculate_host_vulkan_capability(Target t) {
+     const auto *interface = get_device_interface_for_device_api(DeviceAPI::Vulkan, t);
+     internal_assert(interface->compute_capability);
+@@ -650,6 +698,14 @@ const std::map<std::string, Target::Feature> feature_name_map = {
+     {"avx10_1", Target::AVX10_1},
+     {"x86apx", Target::X86APX},
+     {"simulator", Target::Simulator},
++    {"hip", Target::HIP},
++    {"hip_gfx90a", Target::HIPGFX90A},
++    {"hip_gfx942", Target::HIPGFX942},
++    {"hip_gfx950", Target::HIPGFX950},
++    {"hip_gfx1030", Target::HIPGFX1030},
++    {"hip_gfx1100", Target::HIPGFX1100},
++    {"hip_gfx1151", Target::HIPGFX1151},
++    {"hip_gfx1201", Target::HIPGFX1201},
+     // NOTE: When adding features to this map, be sure to update PyEnums.cpp as well.
+ };
+ 
+@@ -803,6 +859,14 @@ bool merge_string(Target &t, const std::string &target) {
+         t.set_feature(get_host_cuda_capability(t));
+     }
+ 
++    if (is_host &&
++        t.has_feature(Target::HIP) &&
++        t.get_hip_arch_feature() == Target::FeatureEnd &&
++        Internal::get_env_variable("HL_HIP_ARCH").empty()) {
++        // Detect host hip architecture (HL_HIP_ARCH, when set, overrides any hip_gfx* feature)
++        t.set_feature(get_host_hip_arch(t));
++    }
++
+     if (is_host &&
+         t.has_feature(Target::Vulkan) &&
+         !t.has_feature(Target::VulkanV10) &&
+@@ -998,6 +1062,31 @@ void Target::validate_features() const {
+                             });
+     }
+ 
++    // HIP architecture features require HIP to also be set.
++    if (!has_feature(HIP)) {
++        do_check_bad(*this, {
++                                HIPGFX90A,
++                                HIPGFX942,
++                                HIPGFX950,
++                                HIPGFX1030,
++                                HIPGFX1100,
++                                HIPGFX1151,
++                                HIPGFX1201,
++                            });
++    }
++
++    const int num_hip_arch_features =
++        (int)has_feature(HIPGFX90A) +
++        (int)has_feature(HIPGFX942) +
++        (int)has_feature(HIPGFX950) +
++        (int)has_feature(HIPGFX1030) +
++        (int)has_feature(HIPGFX1100) +
++        (int)has_feature(HIPGFX1151) +
++        (int)has_feature(HIPGFX1201);
++
++    user_assert(num_hip_arch_features <= 1)
++        << "Target may have at most one hip_gfx* feature (HIP kernels are compiled for a single GPU architecture).\n";
++
+     const int num_sme_svl_features =
+         (int)has_feature(SME_SVL128) +
+         (int)has_feature(SME_SVL256) +
+@@ -1138,6 +1227,9 @@ bool Target::supported() const {
+ #if !defined(WITH_NVPTX)
+     bad |= has_feature(Target::CUDA);
+ #endif
++#if !defined(WITH_AMDGPU)
++    bad |= has_feature(Target::HIP);
++#endif
+ #if !defined(WITH_OPENCL)
+     bad |= has_feature(Target::OpenCL);
+ #endif
+@@ -1342,6 +1434,7 @@ Target Target::without_feature(Feature f) const {
+ 
+ bool Target::has_gpu_feature() const {
+     return (has_feature(CUDA) ||
++            has_feature(HIP) ||
+             has_feature(OpenCL) ||
+             has_feature(Metal) ||
+             has_feature(D3D12Compute) ||
+@@ -1395,6 +1488,52 @@ int Target::get_cuda_capability_lower_bound() const {
+     return 20;
+ }
+ 
++Target::Feature Target::get_hip_arch_feature() const {
++    const Feature arch_features[] = {
++        HIPGFX90A,
++        HIPGFX942,
++        HIPGFX950,
++        HIPGFX1030,
++        HIPGFX1100,
++        HIPGFX1151,
++        HIPGFX1201,
++    };
++    for (Feature f : arch_features) {
++        if (has_feature(f)) {
++            return f;
++        }
++    }
++    return FeatureEnd;
++}
++
++std::string Target::get_hip_arch_string() const {
++    // HL_HIP_ARCH=<gfxNNN[:xnack-][:sramecc+]> overrides any hip_gfx* feature.
++    // Only the -mcpu part is returned here; the AMDGPU codegen reads any
++    // ':'-separated target attribute suffixes from the variable itself.
++    const std::string env_arch = Internal::get_env_variable("HL_HIP_ARCH");
++    if (!env_arch.empty()) {
++        return env_arch.substr(0, env_arch.find(':'));
++    }
++    switch (get_hip_arch_feature()) {
++    case HIPGFX90A:
++        return "gfx90a";
++    case HIPGFX942:
++        return "gfx942";
++    case HIPGFX950:
++        return "gfx950";
++    case HIPGFX1030:
++        return "gfx1030";
++    case HIPGFX1100:
++        return "gfx1100";
++    case HIPGFX1151:
++        return "gfx1151";
++    case HIPGFX1201:
++        return "gfx1201";
++    default:
++        return "";
++    }
++}
++
+ int Target::get_vulkan_capability_lower_bound() const {
+     if (!has_feature(Target::Vulkan)) {
+         return -1;
+@@ -1572,6 +1711,9 @@ DeviceAPI Target::get_required_device_api() const {
+     if (has_feature(Target::CUDA)) {
+         return DeviceAPI::CUDA;
+     }
++    if (has_feature(Target::HIP)) {
++        return DeviceAPI::HIP;
++    }
+     if (has_feature(Target::D3D12Compute)) {
+         return DeviceAPI::D3D12Compute;
+     }
+@@ -1600,6 +1742,8 @@ Target::Feature target_feature_for_device_api(DeviceAPI api) {
+     switch (api) {
+     case DeviceAPI::CUDA:
+         return Target::CUDA;
++    case DeviceAPI::HIP:
++        return Target::HIP;
+     case DeviceAPI::OpenCL:
+         return Target::OpenCL;
+     case DeviceAPI::Metal:
+@@ -1732,12 +1876,23 @@ bool Target::get_runtime_compatible_target(const Target &other, Target &result)
+         // These are true union features.
+         CUDA,
+         D3D12Compute,
++        HIP,
+         Metal,
+         NoNEON,
+         OpenCL,
+         Vulkan,
+         WebGPU,
+ 
++        // hip_gfx* features name a single GPU architecture rather than a capability
++        // level, so they are checked for agreement below before the union is taken.
++        HIPGFX90A,
++        HIPGFX942,
++        HIPGFX950,
++        HIPGFX1030,
++        HIPGFX1100,
++        HIPGFX1151,
++        HIPGFX1201,
++
+         // These features are actually intersection-y, but because targets only record the _highest_,
+         // we have to put their union in the result and then take a lower bound.
+         CUDACapability30,
+@@ -1850,6 +2005,19 @@ bool Target::get_runtime_compatible_target(const Target &other, Target &result)
+         return false;
+     }
+ 
++    // Two targets that both name a HIP architecture must name the same one;
++    // a target with plain 'hip' (no hip_gfx*) is compatible with any of them.
++    {
++        const Feature hip_arch_a = get_hip_arch_feature();
++        const Feature hip_arch_b = other.get_hip_arch_feature();
++        if (hip_arch_a != FeatureEnd && hip_arch_b != FeatureEnd && hip_arch_a != hip_arch_b) {
++            debug(1) << "runtime targets must agree on the HIP architecture (hip_gfx*)\n"
++                     << "  this:  " << *this << "\n"
++                     << "  other: " << other << "\n";
++            return false;
++        }
++    }
++
+     // Union of features is computed through bitwise-or, and masked away by the features we care about
+     // Intersection of features is computed through bitwise-and and masked away, too.
+     // We merge the bits via bitwise or.
+diff --git a/src/Target.h b/src/Target.h
+index f843464..b8bc68d 100644
+--- a/src/Target.h
++++ b/src/Target.h
+@@ -205,6 +205,14 @@ struct Target {
+         HLSL_SM67 = halide_target_feature_hlsl_sm67,
+         HLSL_SM68 = halide_target_feature_hlsl_sm68,
+         HLSL_SM69 = halide_target_feature_hlsl_sm69,
++        HIP = halide_target_feature_hip,
++        HIPGFX90A = halide_target_feature_hip_gfx90a,
++        HIPGFX942 = halide_target_feature_hip_gfx942,
++        HIPGFX950 = halide_target_feature_hip_gfx950,
++        HIPGFX1030 = halide_target_feature_hip_gfx1030,
++        HIPGFX1100 = halide_target_feature_hip_gfx1100,
++        HIPGFX1151 = halide_target_feature_hip_gfx1151,
++        HIPGFX1201 = halide_target_feature_hip_gfx1201,
+         FeatureEnd = halide_target_feature_end
+     };
+     Target() = default;
+@@ -294,7 +302,7 @@ struct Target {
+ 
+     /** Is a fully feature GPU compute runtime enabled? I.e. is
+      * Func::gpu_tile and similar going to work? Currently includes
+-     * CUDA, OpenCL, Metal and D3D12Compute. */
++     * CUDA, HIP, OpenCL, Metal, D3D12Compute, Vulkan and WebGPU. */
+     bool has_gpu_feature() const;
+ 
+     /** Does this target allow using a certain type. Generally all
+@@ -393,6 +401,19 @@ struct Target {
+      * features are set. */
+     int get_cuda_capability_lower_bound() const;
+ 
++    /** Return the single hip_gfx* architecture feature set on this Target
++     * (e.g. Target::HIPGFX942), or FeatureEnd if none is set. At most one
++     * hip_gfx* feature may be set; see validate_features(). */
++    Feature get_hip_arch_feature() const;
++
++    /** Return the LLVM -mcpu name of the AMD GPU architecture this Target
++     * compiles HIP kernels for, e.g. "gfx942". If the HL_HIP_ARCH environment
++     * variable is set it takes precedence over any hip_gfx* feature; only the
++     * part of it before the first ':' is returned (any ":xnack-"/":sramecc+"
++     * suffixes are target attributes that the AMDGPU codegen reads from the
++     * variable itself). Returns an empty string if neither is set. */
++    std::string get_hip_arch_string() const;
++
+     /** Get the minimum Vulkan capability found as an integer. Returns
+      * 10 (our minimum supported Vulkan compute capability) if no Vulkan
+      * features are set. */
+diff --git a/src/halide_ir.fbs b/src/halide_ir.fbs
+index 4bba4bb..cd3b541 100644
+--- a/src/halide_ir.fbs
++++ b/src/halide_ir.fbs
+@@ -105,6 +105,7 @@ enum DeviceAPI: byte {
+     Vulkan,
+     WebGPU,
+     SMEStreaming,
++    HIP,
+ }
+ 
+ enum MemoryType: byte {
+diff --git a/src/runtime/HalideRuntime.h b/src/runtime/HalideRuntime.h
+index e1610b9..e43e826 100644
+--- a/src/runtime/HalideRuntime.h
++++ b/src/runtime/HalideRuntime.h
+@@ -1574,6 +1574,14 @@ typedef enum halide_target_feature_t {
+     halide_target_feature_hlsl_sm67,              ///< Enable D3D12 Shader Model 6.7
+     halide_target_feature_hlsl_sm68,              ///< Enable D3D12 Shader Model 6.8
+     halide_target_feature_hlsl_sm69,              ///< Enable D3D12 Shader Model 6.9 (long vectors 5-1024 lanes, native 16-bit/wave/int64 required)
++    halide_target_feature_hip,                    ///< Enable the HIP (AMD ROCm) runtime. Without a hip_gfx* feature the GPU architecture is autodetected when JIT-compiling for the host, or taken from the HL_HIP_ARCH environment variable.
++    halide_target_feature_hip_gfx90a,             ///< Target the AMD gfx90a architecture (MI200 / CDNA2, wave64). Requires hip.
++    halide_target_feature_hip_gfx942,             ///< Target the AMD gfx942 architecture (MI300A/X / CDNA3, wave64). Requires hip.
++    halide_target_feature_hip_gfx950,             ///< Target the AMD gfx950 architecture (MI350 / CDNA4, wave64). Requires hip.
++    halide_target_feature_hip_gfx1030,            ///< Target the AMD gfx1030 architecture (RDNA2, wave32). Requires hip.
++    halide_target_feature_hip_gfx1100,            ///< Target the AMD gfx1100 architecture (RDNA3, wave32). Requires hip.
++    halide_target_feature_hip_gfx1151,            ///< Target the AMD gfx1151 architecture (Strix Halo / RDNA3.5, wave32). Requires hip.
++    halide_target_feature_hip_gfx1201,            ///< Target the AMD gfx1201 architecture (RDNA4, wave32). Requires hip.
+     halide_target_feature_end                     ///< A sentinel. Every target is considered to have this feature, and setting this feature does nothing.
+ } halide_target_feature_t;
+ 
+diff --git a/src/runtime/runtime_api.cpp b/src/runtime/runtime_api.cpp
+index ed51695..91819f2 100644
+--- a/src/runtime/runtime_api.cpp
++++ b/src/runtime/runtime_api.cpp
+@@ -4,6 +4,7 @@
+ #include "HalideRuntime.h"
+ #include "HalideRuntimeCuda.h"
+ #include "HalideRuntimeD3D12Compute.h"
++#include "HalideRuntimeHIP.h"
+ #include "HalideRuntimeHexagonHost.h"
+ #include "HalideRuntimeMetal.h"
+ #include "HalideRuntimeOpenCL.h"
+@@ -117,6 +118,15 @@ extern "C" __attribute__((used)) void *halide_runtime_api_functions[] = {
+     (void *)&halide_hexagon_set_performance_mode,
+     (void *)&halide_hexagon_set_thread_priority,
+     (void *)&halide_hexagon_wrap_device_handle,
++    (void *)&halide_hip_compute_capability,
++    (void *)&halide_hip_detach_device_ptr,
++    (void *)&halide_hip_device_interface,
++    (void *)&halide_hip_finalize_kernels,
++    (void *)&halide_hip_get_device_ptr,
++    (void *)&halide_hip_initialize_kernels,
++    (void *)&halide_hip_release_unused_device_allocations,
++    (void *)&halide_hip_run,
++    (void *)&halide_hip_wrap_device_ptr,
+     (void *)&halide_int64_to_string,
+     (void *)&halide_join_thread,
+     (void *)&halide_load_library,
+@@ -195,6 +205,9 @@ extern "C" __attribute__((used)) void *halide_runtime_api_functions[] = {
+     (void *)&halide_set_custom_trace,
+     (void *)&halide_set_error_handler,
+     (void *)&halide_set_gpu_device,
++    (void *)&halide_set_hip_acquire_context,
++    (void *)&halide_set_hip_get_stream,
++    (void *)&halide_set_hip_release_context,
+     (void *)&halide_set_num_threads,
+     (void *)&halide_set_trace_file,
+     (void *)&halide_shutdown_thread_pool,
+diff --git a/test/correctness/target.cpp b/test/correctness/target.cpp
+index 77c39df..85c492f 100644
+--- a/test/correctness/target.cpp
++++ b/test/correctness/target.cpp
+@@ -241,6 +241,10 @@ int main(int argc, char **argv) {
+         {"x86-64-linux-cuda", "x86-64-linux", "x86-64-linux-cuda"},
+         {"x86-64-linux-cuda-cuda_capability_50", "x86-64-linux-cuda", "x86-64-linux-cuda"},
+         {"x86-64-linux-cuda-cuda_capability_50", "x86-64-linux-cuda-cuda_capability_30", "x86-64-linux-cuda-cuda_capability_30"},
++        {"x86-64-linux-hip", "x86-64-linux", "x86-64-linux-hip"},
++        {"x86-64-linux-hip-hip_gfx942", "x86-64-linux-hip", "x86-64-linux-hip-hip_gfx942"},
++        {"x86-64-linux-hip-hip_gfx942", "x86-64-linux-hip-hip_gfx942", "x86-64-linux-hip-hip_gfx942"},
++        {"x86-64-linux-hip-hip_gfx942", "x86-64-linux-hip-hip_gfx1100", ""},
+         {"x86-64-linux-vulkan", "x86-64-linux", "x86-64-linux-vulkan"},
+         {"x86-64-linux-vulkan-vk_v13", "x86-64-linux-vulkan", "x86-64-linux-vulkan"},
+         {"x86-64-linux-vulkan-vk_v13", "x86-64-linux-vulkan-vk_v10", "x86-64-linux-vulkan-vk_v10"},
+-- 
+2.43.0
+

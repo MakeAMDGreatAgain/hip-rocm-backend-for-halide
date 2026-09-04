@@ -1,0 +1,2300 @@
+From 1afec62e7e84210b937e636c78706ba93f13e127 Mon Sep 17 00:00:00 2001
+From: Oussama Benjelloun <benje.oussama@gmail.com>
+Date: Fri, 4 Sep 2026 14:25:02 +0200
+Subject: [PATCH 3/7] HIP: add the HIP runtime (halide_hip_*)
+
+Section-by-section mirror of runtime/cuda.cpp on the HIP API: libamdhip64
+is loaded dynamically (no ROCm needed at build time), the device ordinal is
+the context, kernels are launched with hipModuleLaunchKernel(kernelParams)
+so the HIP runtime packs kernargs from code-object metadata, allocations
+use the same free-list reuse as CUDA, and arch detection reads gcnArchName.
+
+Co-authored-by: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/runtime/HalideRuntimeHIP.h |  116 ++
+ src/runtime/hip.cpp            | 1837 ++++++++++++++++++++++++++++++++
+ src/runtime/hip_functions.h    |   67 ++
+ src/runtime/mini_hip.h         |  220 ++++
+ src/runtime/windows_hip.cpp    |    2 +
+ 5 files changed, 2242 insertions(+)
+ create mode 100644 src/runtime/HalideRuntimeHIP.h
+ create mode 100644 src/runtime/hip.cpp
+ create mode 100644 src/runtime/hip_functions.h
+ create mode 100644 src/runtime/mini_hip.h
+ create mode 100644 src/runtime/windows_hip.cpp
+
+diff --git a/src/runtime/HalideRuntimeHIP.h b/src/runtime/HalideRuntimeHIP.h
+new file mode 100644
+index 0000000..bed80a8
+--- /dev/null
++++ b/src/runtime/HalideRuntimeHIP.h
+@@ -0,0 +1,116 @@
++#ifndef HALIDE_HALIDERUNTIMEHIP_H
++#define HALIDE_HALIDERUNTIMEHIP_H
++
++// Don't include HalideRuntime.h if the contents of it were already pasted into a generated header above this one
++#ifndef HALIDE_HALIDERUNTIME_H
++
++#include "HalideRuntime.h"
++
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** \file
++ *  Routines specific to the Halide HIP (AMD ROCm) runtime. This is the HIP
++ *  counterpart of HalideRuntimeCuda.h.
++ */
++
++#define HALIDE_RUNTIME_HIP
++
++extern const struct halide_device_interface_t *halide_hip_device_interface();
++
++/** These are forward declared here to allow clients to override the
++ *  Halide HIP runtime. Do not call them. */
++// @{
++extern int halide_hip_initialize_kernels(void *user_context, void **state_ptr,
++                                         const char *src, int size);
++extern int halide_hip_run(void *user_context,
++                          void *state_ptr,
++                          const char *entry_name,
++                          int blocksX, int blocksY, int blocksZ,
++                          int threadsX, int threadsY, int threadsZ,
++                          int shared_mem_bytes,
++                          size_t arg_sizes[],
++                          void *args[],
++                          int8_t arg_is_buffer[]);
++extern void halide_hip_finalize_kernels(void *user_context, void *state_ptr);
++// @}
++
++/** Set the underlying HIP device pointer for a buffer. The device
++ * pointer should be allocated using hipMalloc or similar and must
++ * have an extent large enough to cover that specified by the
++ * halide_buffer_t extent fields. The dev field of the halide_buffer_t
++ * must be NULL when this routine is called. This call can fail due to
++ * being passed an invalid device pointer. The device and host dirty
++ * bits are left unmodified. */
++extern int halide_hip_wrap_device_ptr(void *user_context, struct halide_buffer_t *buf, uint64_t device_ptr);
++
++/** Disconnect this halide_buffer_t from the device pointer it was
++ * previously wrapped around. Should only be called for a
++ * halide_buffer_t that halide_hip_wrap_device_ptr was previously
++ * called on. The device field of the halide_buffer_t will be NULL on
++ * return.
++ */
++extern int halide_hip_detach_device_ptr(void *user_context, struct halide_buffer_t *buf);
++
++/** Return the underlying device pointer for a halide_buffer_t. This buffer
++ *  must be valid on a HIP device, or not have any associated device
++ *  memory. If there is no device memory (dev field is NULL), this
++ *  returns 0.
++ */
++extern uintptr_t halide_hip_get_device_ptr(void *user_context, struct halide_buffer_t *buf);
++
++/** Release any currently-unused device allocations back to the HIP
++ * runtime. See halide_reuse_device_allocations. */
++extern int halide_hip_release_unused_device_allocations(void *user_context);
++
++/** Report the architecture of the HIP device Halide would use, in a form
++ * that Target.cpp maps to a hip_gfx* feature. Unlike CUDA there is no
++ * numeric compute capability on AMD GPUs; the "gfxNNNN" ISA name is encoded
++ * as:
++ *
++ *   major = the gfx generation, i.e. the decimal value of all but the last
++ *           two characters of the gfx id (9, 10, 11, 12, ...)
++ *   minor = the last two characters of the gfx id read as HEX digits
++ *           (gfx90a's trailing 'a' is a hex digit, hence hex)
++ *
++ *   gfx90a  -> (9,  0x0a)      gfx1030 -> (10, 0x30)
++ *   gfx942  -> (9,  0x42)      gfx1100 -> (11, 0x00)
++ *   gfx950  -> (9,  0x50)      gfx1151 -> (11, 0x51)
++ *                              gfx1201 -> (12, 0x01)
++ *
++ * The runtime derives this from the device's gcnArchName (e.g.
++ * "gfx942:sramecc+:xnack-", features ignored) when available, from the
++ * ROCm 5.x hipDeviceAttributeGcnArch integer otherwise, and as a last resort
++ * from hipDeviceComputeCapability (which only knows the ISA major/minor, so
++ * the stepping digit is reported as 0, e.g. gfx942 -> (9, 0x40); Target.cpp
++ * will then ask for HL_HIP_ARCH). Returns (0, 0) without error if no HIP
++ * runtime library can be found. */
++extern int halide_hip_compute_capability(void *user_context, int *major, int *minor);
++
++// HIP has no driver contexts: the "context" is the device ordinal that the
++// runtime selects with hipSetDevice. Streams are treated as void * to avoid
++// dependencies on HIP headers.
++typedef int (*halide_hip_acquire_context_t)(void *,  // user_context
++                                            int *,   // device ordinal out parameter (-1 if none and !create)
++                                            bool);   // should initialize HIP / select a device if not done yet
++typedef int (*halide_hip_release_context_t)(void * /* user_context */);
++typedef int (*halide_hip_get_stream_t)(void *,    // user_context
++                                       int,       // device ordinal
++                                       void **);  // hipStream_t out parameter (nullptr = null stream)
++
++/** Set custom methods to acquire and release the HIP device and streams.
++ *  Each returns the previously installed handler. */
++// @{
++extern halide_hip_acquire_context_t halide_set_hip_acquire_context(halide_hip_acquire_context_t handler);
++extern halide_hip_release_context_t halide_set_hip_release_context(halide_hip_release_context_t handler);
++extern halide_hip_get_stream_t halide_set_hip_get_stream(halide_hip_get_stream_t handler);
++// @}
++
++#ifdef __cplusplus
++}  // End extern "C"
++#endif
++
++#endif  // HALIDE_HALIDERUNTIMEHIP_H
+diff --git a/src/runtime/hip.cpp b/src/runtime/hip.cpp
+new file mode 100644
+index 0000000..1d7dd06
+--- /dev/null
++++ b/src/runtime/hip.cpp
+@@ -0,0 +1,1837 @@
++// HIP (AMD ROCm) runtime for Halide. This file is a section-by-section mirror
++// of cuda.cpp; when in doubt about a code path, look at the same-named
++// function there. Intentional differences from cuda.cpp:
++//
++//  * No driver contexts. HIP's notion of a "current device" is a per-thread
++//    device ordinal set with hipSetDevice (the analogue of cuCtxPushCurrent).
++//    Halide's "context" is therefore the device ordinal: the acquire/release
++//    hooks hand out an int, the RAII Context does hipSetDevice/restore, and
++//    the compilation cache is keyed on the ordinal (encoded as a void *,
++//    because GPUCompilationCache needs a pointer-like key).
++//  * Kernel arguments are not packed by hand. Exactly like cuLaunchKernel,
++//    hipModuleLaunchKernel packs `kernelParams` itself using the code object's
++//    .args metadata (offset/size per argument), so buffer arguments are
++//    translated to a pointer-to-device-handle and everything else is passed
++//    through. HL_HIP_PACK_KERNARGS=1 switches to the alternative `extra`
++//    (HIP_LAUNCH_PARAM_BUFFER_POINTER) path for diagnosing kernarg ABI issues.
++//  * One library provides everything (libamdhip64.so.N / amdhip64_N.dll);
++//    HL_HIP_LIB=<path> overrides the search list.
++//  * hipDeviceptr_t is a void *, stored in halide_buffer_t::device as uint64_t.
++//  * halide_hip_compute_capability reports the gfx ISA id (see
++//    HalideRuntimeHIP.h for the encoding) derived from gcnArchName, since
++//    AMD GPUs have no numeric compute capability.
++//  * hipDrvMemcpy3D[Async] is used for strided copies of up to three
++//    dimensions when it is available (HL_HIP_DISABLE_MEMCPY3D=1 forces the
++//    recursive 1-D path that cuda.cpp uses unconditionally).
++//  * halide_hip_device_release does not call hipDeviceReset (that would tear
++//    down every allocation of every HIP user in the process); it synchronizes,
++//    frees Halide's pool and modules, and forgets the selected device.
++
++#include "HalideRuntimeHIP.h"
++#include "device_buffer_utils.h"
++#include "device_interface.h"
++#include "gpu_context_common.h"
++#include "mini_hip.h"
++#include "printer.h"
++#include "scoped_mutex_lock.h"
++#include "scoped_spin_lock.h"
++
++namespace Halide {
++namespace Runtime {
++namespace Internal {
++namespace Hip {
++
++// Define the function pointers for the HIP API.
++
++// clang-format off
++#define HIP_FN(ret, fn, args)             WEAK ret(HIPAPI *fn) args;  // NOLINT(bugprone-macro-parentheses)
++#define HIP_FN_OPTIONAL(ret, fn, args)    WEAK ret(HIPAPI *fn) args;  // NOLINT(bugprone-macro-parentheses)
++#include "hip_functions.h"
++#undef HIP_FN
++#undef HIP_FN_OPTIONAL
++// clang-format on
++
++// The default implementation of halide_hip_get_symbol attempts to load
++// the HIP shared library/DLL, and then get the symbol from it.
++WEAK void *lib_hip = nullptr;
++volatile ScopedSpinLock::AtomicFlag WEAK lib_hip_lock = 0;
++
++extern "C" WEAK void *halide_hip_get_symbol(void *user_context, const char *name) {
++    // Only try to load the library if we can't already get the symbol
++    // from the library. Even if the library is nullptr, the symbols may
++    // already be available in the process.
++    void *symbol = halide_get_library_symbol(lib_hip, name);
++    if (symbol) {
++        return symbol;
++    }
++
++    // HL_HIP_LIB=<path or soname> takes precedence over the built-in list.
++    const char *env_libname = getenv("HL_HIP_LIB");
++    if (env_libname) {
++        lib_hip = halide_load_library(env_libname);
++        if (lib_hip) {
++            debug(user_context) << "    Loaded HIP runtime library (HL_HIP_LIB): " << env_libname << "\n";
++        } else {
++            debug(user_context) << "    Missing HIP runtime library (HL_HIP_LIB): " << env_libname << "\n";
++        }
++    }
++
++    if (!lib_hip) {
++        // Versioned sonames first (ROCm 7.x ships libamdhip64.so.7, ROCm 6.x
++        // libamdhip64.so.6), then the unversioned dev symlink.
++        const char *lib_names[] = {
++#ifdef WINDOWS
++            "amdhip64_7.dll",
++            "amdhip64_6.dll",
++            "amdhip64.dll",
++#else
++            "libamdhip64.so.7",
++            "libamdhip64.so.6",
++            "libamdhip64.so",
++#endif
++        };
++        for (auto &lib_name : lib_names) {
++            lib_hip = halide_load_library(lib_name);
++            if (lib_hip) {
++                debug(user_context) << "    Loaded HIP runtime library: " << lib_name << "\n";
++                break;
++            } else {
++                debug(user_context) << "    Missing HIP runtime library: " << lib_name << "\n";
++            }
++        }
++    }
++
++    return halide_get_library_symbol(lib_hip, name);
++}
++
++template<typename T>
++ALWAYS_INLINE halide_error_code_t get_hip_symbol(void *user_context, const char *name, bool optional, T &fn) {
++    fn = (T)halide_hip_get_symbol(user_context, name);
++    if (!optional && !fn) {
++        error(user_context) << "HIP API not found: " << name
++                            << " (could not load libamdhip64 / amdhip64.dll; is ROCm installed? "
++                               "Set HL_HIP_LIB to an explicit path to override the search.)";
++        return halide_error_code_symbol_not_found;
++    }
++    return halide_error_code_success;
++}
++
++// Load the HIP shared object/dll and get the HIP API function pointers from it.
++WEAK int load_libhip(void *user_context) {
++    debug(user_context) << "    load_libhip (user_context: " << user_context << ")\n";
++    halide_abort_if_false(user_context, hipInit == nullptr);
++    halide_error_code_t result;
++
++    // clang-format off
++#define HIP_FN(ret, fn, args)          result = get_hip_symbol<ret(HIPAPI *) args>(user_context, #fn, false, fn); if (result) return result;  // NOLINT(bugprone-macro-parentheses)
++#define HIP_FN_OPTIONAL(ret, fn, args) result = get_hip_symbol<ret(HIPAPI *) args>(user_context, #fn, true, fn); if (result) return result;   // NOLINT(bugprone-macro-parentheses)
++#include "hip_functions.h"
++#undef HIP_FN
++#undef HIP_FN_OPTIONAL
++    // clang-format on
++    return halide_error_code_success;
++}
++
++// Call load_libhip() if the HIP library has not been loaded.
++// This function is thread safe.
++// Note that initialization might fail. The caller can detect such failure by checking whether hipInit is nullptr.
++WEAK int ensure_libhip_init(void *user_context) {
++    ScopedSpinLock spinlock(&lib_hip_lock);
++    if (!hipInit) {
++        return load_libhip(user_context);
++    }
++    return halide_error_code_success;
++}
++
++extern WEAK halide_device_interface_t hip_device_interface;
++
++WEAK const char *get_hip_error_name(hipError_t error);
++WEAK int create_hip_context(void *user_context, int *device);
++WEAK int get_hip_arch(void *user_context, int device, int *major, int *minor);
++
++template<typename... Args>
++int error_hip(void *user_context, hipError_t hip_error, const Args &...args) {
++    if (hip_error == hipSuccess) {
++        return halide_error_code_success;
++    }
++    error(user_context).append("HIP error: ", get_hip_error_name(hip_error), " ", args...);
++    return halide_error_code_gpu_device_error;
++}
++
++// The device ordinal this module has selected, with weak linkage. This is
++// the HIP analogue of cuda.cpp's `context`. -1 means "not initialized".
++WEAK int context_device = -1;
++// This lock protects the above variable.
++WEAK halide_mutex context_lock;
++
++// GPUCompilationCache wants a pointer-like key (release_all() passes
++// nullptr for "any context"), so the device ordinal is encoded as
++// (void *)(device + 1); the +1 keeps device 0 distinct from "no context".
++ALWAYS_INLINE void *device_cache_key(int device) {
++    return (void *)(uintptr_t)(device + 1);
++}
++
++// A free list, used when allocations are being cached.
++WEAK struct FreeListItem {
++    hipDeviceptr_t ptr;
++    int device;
++    hipStream_t stream;
++    size_t size;
++    FreeListItem *next;
++} *free_list = nullptr;
++WEAK halide_mutex free_list_lock;
++
++// Cached environment switches (-1 = not read yet).
++WEAK int env_pack_kernargs = -1;
++WEAK int env_disable_memcpy3d = -1;
++
++ALWAYS_INLINE bool env_flag_set(int &cache, const char *name) {
++    if (cache < 0) {
++        const char *v = getenv(name);
++        cache = (v && v[0] != 0 && v[0] != '0') ? 1 : 0;
++    }
++    return cache != 0;
++}
++
++}  // namespace Hip
++}  // namespace Internal
++}  // namespace Runtime
++}  // namespace Halide
++
++using namespace Halide::Runtime::Internal;
++using namespace Halide::Runtime::Internal::Hip;
++
++extern "C" {
++
++// The default implementation of halide_hip_acquire_context uses the global
++// device ordinal above, and serializes access with a mutex.
++// Overriding implementations of acquire/release must implement the following
++// behavior:
++// - halide_hip_acquire_context should always store a valid device ordinal in
++//   *device (or -1 when create == false and nothing is initialized), or
++//   return an error code.
++// - A call to halide_hip_acquire_context is followed by a matching call to
++//   halide_hip_release_context. halide_hip_acquire_context should block while a
++//   previous call (if any) has not yet been released via halide_hip_release_context.
++WEAK int halide_default_hip_acquire_context(void *user_context, int *device, bool create = true) {
++    halide_abort_if_false(user_context, device != nullptr);
++
++    // Note that this check of the device is *not* locked with respect to
++    // device_release, so we may get a device that's in the process of
++    // being released. Things will go badly in general if you call
++    // device_release while other Halide code is running though.
++    int local_val = context_device;
++    if (local_val < 0) {
++        if (!create) {
++            *device = -1;
++            return halide_error_code_success;
++        }
++
++        {
++            ScopedMutexLock spinlock(&context_lock);
++            local_val = context_device;
++            if (local_val < 0) {
++                if (auto result = create_hip_context(user_context, &local_val);
++                    result != halide_error_code_success) {
++                    return result;
++                }
++            }
++            // create_hip_context cannot access the "context_device" global,
++            // so a plain store is fine here (see cuda.cpp for the reasoning).
++            context_device = local_val;
++        }  // spinlock
++    }
++
++    *device = local_val;
++    return halide_error_code_success;
++}
++
++WEAK int halide_default_hip_release_context(void *user_context) {
++    return halide_error_code_success;
++}
++
++// Return the stream to use for executing kernels and synchronization. Default
++// is to use the null stream (nullptr). The device is passed in for
++// convenience, but any sort of scoping must be handled by that of the
++// halide_hip_acquire_context/halide_hip_release_context pair, not this call.
++WEAK int halide_default_hip_get_stream(void *user_context, int device, hipStream_t *stream) {
++    *stream = nullptr;
++    return halide_error_code_success;
++}
++
++}  // extern "C"
++
++namespace Halide {
++namespace Runtime {
++namespace Internal {
++namespace HIP {
++
++WEAK halide_hip_acquire_context_t acquire_context = (halide_hip_acquire_context_t)halide_default_hip_acquire_context;
++WEAK halide_hip_release_context_t release_context = (halide_hip_release_context_t)halide_default_hip_release_context;
++WEAK halide_hip_get_stream_t get_stream = (halide_hip_get_stream_t)halide_default_hip_get_stream;
++
++}  // namespace HIP
++}  // namespace Internal
++}  // namespace Runtime
++}  // namespace Halide
++
++extern "C" {
++
++WEAK int halide_hip_acquire_context(void *user_context, int *device, bool create = true) {
++    return HIP::acquire_context(user_context, device, create);
++}
++
++WEAK halide_hip_acquire_context_t halide_set_hip_acquire_context(halide_hip_acquire_context_t handler) {
++    halide_hip_acquire_context_t result = HIP::acquire_context;
++    HIP::acquire_context = handler;
++    return result;
++}
++
++WEAK int halide_hip_release_context(void *user_context) {
++    return HIP::release_context(user_context);
++}
++
++WEAK halide_hip_release_context_t halide_set_hip_release_context(halide_hip_release_context_t handler) {
++    halide_hip_release_context_t result = HIP::release_context;
++    HIP::release_context = handler;
++    return result;
++}
++
++WEAK int halide_hip_get_stream(void *user_context, int device, hipStream_t *stream) {
++    return HIP::get_stream(user_context, device, (void **)stream);
++}
++
++WEAK halide_hip_get_stream_t halide_set_hip_get_stream(halide_hip_get_stream_t handler) {
++    halide_hip_get_stream_t result = HIP::get_stream;
++    HIP::get_stream = handler;
++    return result;
++}
++}
++
++namespace Halide {
++namespace Runtime {
++namespace Internal {
++namespace Hip {
++
++// Helper object to acquire and release the HIP device. The HIP equivalent of
++// cuCtxPushCurrent/cuCtxPopCurrent is hipSetDevice on entry and restoring the
++// thread's previous device on exit.
++class Context {
++    void *const user_context;
++    int status = halide_error_code_success;  // must always be a valid halide_error_code_t value
++    int previous_device = -1;
++    bool device_changed = false;
++
++public:
++    int device = -1;
++
++    // Constructor sets 'status' if any error occurs.
++    ALWAYS_INLINE explicit Context(void *user_context)
++        : user_context(user_context) {
++#ifdef DEBUG_RUNTIME
++        halide_start_clock(user_context);
++#endif
++        status = halide_hip_acquire_context(user_context, &device);
++        if (status) {
++            return;
++        }
++
++        // The default acquire_context loads libamdhip64 as a
++        // side-effect. However, if acquire_context has been
++        // overridden, we may still need to load it.
++        status = ensure_libhip_init(user_context);
++        if (status) {
++            return;
++        }
++
++        halide_abort_if_false(user_context, device >= 0);
++        halide_abort_if_false(user_context, hipInit != nullptr);
++
++        if (hipGetDevice(&previous_device) != hipSuccess) {
++            previous_device = -1;
++        }
++        if (previous_device != device) {
++            status = error_hip(user_context, hipSetDevice(device), "hipSetDevice failed");
++            device_changed = (status == halide_error_code_success);
++        }
++    }
++
++    ALWAYS_INLINE ~Context() {
++        if (status == halide_error_code_success && device_changed && previous_device >= 0) {
++            hipSetDevice(previous_device);
++        }
++
++        (void)halide_hip_release_context(user_context);  // ignore error
++    }
++
++    ALWAYS_INLINE int error() const {
++        return status;
++    }
++
++    // Key for the compilation cache.
++    ALWAYS_INLINE void *cache_key() const {
++        return device_cache_key(device);
++    }
++
++    Context(const Context &) = delete;
++    Context &operator=(const Context &) = delete;
++    Context(Context &&) = delete;
++    Context &operator=(Context &&) = delete;
++};
++
++WEAK Halide::Internal::GPUCompilationCache<void *, hipModule_t> compilation_cache;
++
++WEAK int create_hip_context(void *user_context, int *device_out) {
++    // Initialize HIP
++    auto result = ensure_libhip_init(user_context);
++    if (result) {
++        return result;
++    }
++    if (!hipInit) {
++        return error_hip(user_context, hipErrorFileNotFound,
++                         "Could not find the HIP runtime library (libamdhip64 / amdhip64.dll)");
++    }
++
++    hipError_t err = hipInit(0);
++    if (err != hipSuccess) {
++        return error_hip(user_context, err, "hipInit failed");
++    }
++
++#ifdef DEBUG_RUNTIME
++    if (hipRuntimeGetVersion) {
++        int version = 0;
++        if (hipRuntimeGetVersion(&version) == hipSuccess) {
++            debug(user_context) << "    HIP runtime version " << version << "\n";
++        }
++    }
++#endif
++
++    // Make sure we have a device
++    int deviceCount = 0;
++    err = hipGetDeviceCount(&deviceCount);
++    if (err != hipSuccess) {
++        return error_hip(user_context, err, "hipGetDeviceCount failed");
++    }
++
++    if (deviceCount <= 0) {
++        return error_hip(user_context, hipErrorNoDevice, "No devices available");
++    }
++
++    int device = halide_get_gpu_device(user_context);
++    if (device == -1 && deviceCount == 1) {
++        device = 0;
++    } else if (device == -1) {
++        debug(user_context) << "HIP: Multiple HIP devices detected. Selecting the one with the most compute units.\n";
++        int best_core_count = 0;
++        for (int i = 0; i < deviceCount; i++) {
++            hipDevice_t dev;
++            hipError_t status = hipDeviceGet(&dev, i);
++            if (status != hipSuccess) {
++                debug(user_context) << "      Failed to get device " << i << "\n";
++                continue;
++            }
++            int core_count = 0;
++            status = hipDeviceGetAttribute(&core_count, hipDeviceAttributeMultiprocessorCount, dev);
++            debug(user_context) << "      Device " << i << " has " << core_count << " compute units\n";
++            if (status != hipSuccess) {
++                continue;
++            }
++            if (core_count >= best_core_count) {
++                device = i;
++                best_core_count = core_count;
++            }
++        }
++    }
++
++    if (device < 0 || device >= deviceCount) {
++        return error_hip(user_context, hipErrorInvalidDevice, "Requested HIP device ordinal (HL_GPU_DEVICE) is out of range");
++    }
++
++    // Get device
++    hipDevice_t dev;
++    err = hipDeviceGet(&dev, device);
++    if (err != hipSuccess) {
++        return error_hip(user_context, err, "Failed to get device");
++    }
++
++    debug(user_context) << "    Got device " << dev << "\n";
++
++// Dump device attributes
++#ifdef DEBUG_RUNTIME
++    {
++        char name[256];
++        name[0] = 0;
++        err = hipDeviceGetName(name, 256, dev);
++        debug(user_context) << "      " << name << "\n";
++
++        if (err != hipSuccess) {
++            return error_hip(user_context, err, "hipDeviceGetName failed");
++        }
++
++        size_t memory = 0;
++        err = hipDeviceTotalMem(&memory, dev);
++        debug(user_context) << "      total memory: " << (int)(memory >> 20) << " MB\n";
++
++        if (err != hipSuccess) {
++            return error_hip(user_context, err, "hipDeviceTotalMem failed");
++        }
++
++        // Declare variables for other state we want to query.
++        int max_threads_per_block = 0, warp_size = 0, num_cores = 0;
++        int max_block_size[] = {0, 0, 0};
++        int max_grid_size[] = {0, 0, 0};
++        int max_shared_mem = 0, max_constant_mem = 0;
++        int cc_major = 0, cc_minor = 0;
++
++        struct {
++            int *dst;
++            hipDeviceAttribute_t attr;
++        } attrs[] = {
++            {&max_threads_per_block, hipDeviceAttributeMaxThreadsPerBlock},
++            {&warp_size, hipDeviceAttributeWarpSize},
++            {&num_cores, hipDeviceAttributeMultiprocessorCount},
++            {&max_block_size[0], hipDeviceAttributeMaxBlockDimX},
++            {&max_block_size[1], hipDeviceAttributeMaxBlockDimY},
++            {&max_block_size[2], hipDeviceAttributeMaxBlockDimZ},
++            {&max_grid_size[0], hipDeviceAttributeMaxGridDimX},
++            {&max_grid_size[1], hipDeviceAttributeMaxGridDimY},
++            {&max_grid_size[2], hipDeviceAttributeMaxGridDimZ},
++            {&max_shared_mem, hipDeviceAttributeMaxSharedMemoryPerBlock},
++            {&max_constant_mem, hipDeviceAttributeTotalConstantMemory},
++            {&cc_major, hipDeviceAttributeComputeCapabilityMajor},
++            {&cc_minor, hipDeviceAttributeComputeCapabilityMinor},
++            {nullptr, hipDeviceAttributeCudaCompatibleBegin}};
++
++        // Do all the queries.
++        for (int i = 0; attrs[i].dst; i++) {
++            err = hipDeviceGetAttribute(attrs[i].dst, attrs[i].attr, dev);
++            if (err != hipSuccess) {
++                return error_hip(user_context, err, "hipDeviceGetAttribute failed for attribute ", (int)attrs[i].attr);
++            }
++        }
++
++        int arch_major = 0, arch_minor = 0;
++        (void)get_hip_arch(user_context, device, &arch_major, &arch_minor);
++
++        debug(user_context)
++            << "      max threads per block: " << max_threads_per_block << "\n"
++            << "      wavefront size: " << warp_size << "\n"
++            << "      max block size: " << max_block_size[0]
++            << " " << max_block_size[1] << " " << max_block_size[2] << "\n"
++            << "      max grid size: " << max_grid_size[0]
++            << " " << max_grid_size[1] << " " << max_grid_size[2] << "\n"
++            << "      max shared memory (LDS) per block: " << max_shared_mem << "\n"
++            << "      max constant memory: " << max_constant_mem << "\n"
++            << "      isa version " << cc_major << "." << cc_minor
++            << " (halide_hip_compute_capability encoding: major " << arch_major
++            << ", minor " << arch_minor << " decimal)\n"
++            << "      compute units: " << num_cores << "\n";
++    }
++#endif
++
++    // There is no context to create: the device is selected per thread by
++    // Context (hipSetDevice). Just hand back the ordinal.
++    *device_out = device;
++    return halide_error_code_success;
++}
++
++// This feature may be useful during HIP backend or runtime
++// development. It does not seem to find many errors in general Halide
++// use (and hipPointerGetAttributes is optional in the loaded library).
++#define ENABLE_POINTER_VALIDATION 0
++
++WEAK int validate_device_pointer(void *user_context, halide_buffer_t *buf, size_t size = 0) {
++#if !ENABLE_POINTER_VALIDATION
++    return halide_error_code_success;
++#else
++    if (buf->device != 0 && hipPointerGetAttributes != nullptr) {
++        hipDeviceptr_t dev_ptr = (hipDeviceptr_t)(uintptr_t)buf->device;
++
++        // hipPointerAttribute_t is ~40 bytes in every ROCm release; use an
++        // oversized, zeroed, opaque buffer and only look at the error code.
++        uint64_t attributes[64];
++        memset(attributes, 0, sizeof(attributes));
++        hipError_t err = hipPointerGetAttributes((hipPointerAttribute_t *)attributes, (const void *)dev_ptr);
++        if (err != hipSuccess) {
++            return error_hip(user_context, err, "Bad device pointer ", (void *)dev_ptr);
++        }
++    }
++    return halide_error_code_success;
++#endif
++}
++
++WEAK hipModule_t compile_kernel(void *user_context, const char *src, int size) {
++    debug(user_context) << "HIP: compile_kernel hipModuleLoadData " << (void *)src << ", " << size << " -> ";
++
++    // `src` is a complete AMDGPU code object (ET_DYN ELF produced by lld) or a
++    // clang offload bundle; hipModuleLoadData accepts either and needs no
++    // JIT options.
++    hipModule_t loaded_module = nullptr;
++    hipError_t err = hipModuleLoadData(&loaded_module, src);
++
++    if (err != hipSuccess) {
++        if (err == hipErrorNoBinaryForGpu) {
++            error(user_context) << "HIP: hipModuleLoadData failed: " << get_hip_error_name(err)
++                                << ". The code object was built for a GPU architecture that does not match "
++                                   "the selected device (e.g. compiled for hip_gfx942 but running on gfx1100). "
++                                   "Set HL_HIP_ARCH=gfxNNNN (or the matching hip_gfx* target feature) to the "
++                                   "device's architecture, or select a different device with HL_GPU_DEVICE.";
++        } else if (err == hipErrorInvalidImage || err == hipErrorInvalidKernelFile) {
++            error(user_context) << "HIP: hipModuleLoadData failed: " << get_hip_error_name(err)
++                                << ". The embedded kernel image is not a code object this ROCm runtime accepts. "
++                                   "Check that it is an lld-linked ET_DYN ELF for amdgcn-amd-amdhsa and that its "
++                                   "code-object version (HL_HIP_CODE_OBJECT_VERSION, default 5) is supported by "
++                                   "the installed ROCm.";
++        } else {
++            error(user_context) << "HIP: hipModuleLoadData failed: "
++                                << get_hip_error_name(err);
++        }
++        return nullptr;
++    } else {
++        debug(user_context) << (void *)(loaded_module) << "\n";
++    }
++    return loaded_module;
++}
++
++}  // namespace Hip
++}  // namespace Internal
++}  // namespace Runtime
++}  // namespace Halide
++
++extern "C" {
++WEAK int halide_hip_initialize_kernels(void *user_context, void **state_ptr, const char *src, int size) {
++    debug(user_context) << "HIP: halide_hip_initialize_kernels (user_context: " << user_context
++                        << ", state_ptr: " << state_ptr
++                        << ", src: " << (void *)src
++                        << ", size: " << size << "\n";
++
++    Context ctx(user_context);
++    if (ctx.error()) {
++        return ctx.error();
++    }
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_before = halide_current_time_ns(user_context);
++#endif
++
++    hipModule_t loaded_module;
++    if (!compilation_cache.kernel_state_setup(user_context, state_ptr, ctx.cache_key(), loaded_module,
++                                              compile_kernel, user_context, src, size)) {
++        return halide_error_code_generic_error;
++    }
++    halide_abort_if_false(user_context, loaded_module != nullptr);
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_after = halide_current_time_ns(user_context);
++    debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
++#endif
++
++    return halide_error_code_success;
++}
++
++WEAK void halide_hip_finalize_kernels(void *user_context, void *state_ptr) {
++    Context ctx(user_context);
++    if (ctx.error() == halide_error_code_success) {
++        compilation_cache.release_hold(user_context, ctx.cache_key(), state_ptr);
++    }
++}
++
++WEAK int halide_hip_release_unused_device_allocations(void *user_context) {
++    FreeListItem *to_free;
++    {
++        ScopedMutexLock lock(&free_list_lock);
++        to_free = free_list;
++        free_list = nullptr;
++    }
++    while (to_free) {
++        debug(user_context) << "    hipFree " << (void *)(to_free->ptr) << "\n";
++        hipFree(to_free->ptr);
++        FreeListItem *next = to_free->next;
++        free(to_free);
++        to_free = next;
++    }
++    return halide_error_code_success;
++}
++
++namespace Halide {
++namespace Runtime {
++namespace Internal {
++
++WEAK halide_device_allocation_pool hip_allocation_pool;
++
++WEAK __attribute__((constructor)) void register_hip_allocation_pool() {
++    hip_allocation_pool.release_unused = &halide_hip_release_unused_device_allocations;
++    halide_register_device_allocation_pool(&hip_allocation_pool);
++}
++
++namespace Hip {
++
++ALWAYS_INLINE uint64_t quantize_allocation_size(uint64_t sz) {
++    int z = __builtin_clzll(sz);
++    if (z < 60) {
++        sz--;
++        sz = sz >> (60 - z);
++        sz++;
++        sz = sz << (60 - z);
++    }
++    return sz;
++}
++
++}  // namespace Hip
++}  // namespace Internal
++}  // namespace Runtime
++}  // namespace Halide
++
++WEAK int halide_hip_device_free(void *user_context, halide_buffer_t *buf) {
++    // halide_device_free, at present, can be exposed to clients and they
++    // should be allowed to call halide_device_free on any halide_buffer_t
++    // including ones that have never been used with a GPU.
++    if (buf->device == 0) {
++        return halide_error_code_success;
++    }
++
++    hipDeviceptr_t dev_ptr = (hipDeviceptr_t)(uintptr_t)buf->device;
++
++    debug(user_context)
++        << "HIP: halide_hip_device_free (user_context: " << user_context
++        << ", buf: " << buf << ")\n";
++
++    Context ctx(user_context);
++    if (ctx.error()) {
++        return ctx.error();
++    }
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_before = halide_current_time_ns(user_context);
++#endif
++
++    auto result = validate_device_pointer(user_context, buf);
++    if (result) {
++        return result;
++    }
++
++    hipError_t err = hipSuccess;
++    if (halide_can_reuse_device_allocations(user_context)) {
++        debug(user_context) << "    caching allocation for later use: " << (void *)(dev_ptr) << "\n";
++
++        FreeListItem *item = (FreeListItem *)malloc(sizeof(FreeListItem));
++        item->device = ctx.device;
++        item->size = quantize_allocation_size(buf->size_in_bytes());
++        item->ptr = dev_ptr;
++
++        // We don't want to use a buffer freed one stream on
++        // another, as there are no synchronization guarantees and
++        // everything is async.
++        result = halide_hip_get_stream(user_context, ctx.device, &item->stream);
++        if (result) {
++            free(item);
++            return result;
++        }
++
++        {
++            ScopedMutexLock lock(&free_list_lock);
++            item->next = free_list;
++            free_list = item;
++        }
++    } else {
++        debug(user_context) << "    hipFree " << (void *)(dev_ptr) << "\n";
++        err = hipFree(dev_ptr);
++        // If hipFree fails, it isn't likely to succeed later, so just drop
++        // the reference.
++    }
++    buf->device_interface->impl->release_module();
++    buf->device_interface = nullptr;
++    buf->device = 0;
++    if (err != hipSuccess) {
++        // We may be called as a destructor, so don't raise an error here.
++        return error_hip(user_context, err);
++    }
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_after = halide_current_time_ns(user_context);
++    debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
++#endif
++
++    return halide_error_code_success;
++}
++
++WEAK int halide_hip_device_release(void *user_context) {
++    debug(user_context)
++        << "HIP: halide_hip_device_release (user_context: " << user_context << ")\n";
++
++    // If we haven't even loaded libamdhip64, don't load it just to quit.
++    if (!hipInit) {
++        return halide_error_code_success;
++    }
++
++    int device = -1;
++    auto result = halide_hip_acquire_context(user_context, &device, false);
++    if (result) {
++        return result;
++    }
++
++    if (device >= 0) {
++        // It's possible that this is being called from the destructor of
++        // a static variable, in which case the runtime may already be
++        // shutting down.
++        hipError_t err = hipSetDevice(device);
++        if (err == hipSuccess) {
++            err = hipDeviceSynchronize();
++        }
++        if (err != hipSuccess && err != hipErrorDeinitialized) {
++            return error_hip(user_context, err);
++        }
++
++        // Dump the contents of the free list, ignoring errors.
++        (void)halide_hip_release_unused_device_allocations(user_context);
++
++        compilation_cache.delete_context(user_context, device_cache_key(device), hipModuleUnload);
++
++        // Only forget the device if we own it. There is nothing to destroy:
++        // HIP has no per-process context, and hipDeviceReset is deliberately
++        // NOT called because it would also destroy allocations made by other
++        // HIP users in this process.
++        {
++            ScopedMutexLock spinlock(&context_lock);
++
++            if (device == context_device) {
++                debug(user_context) << "    releasing HIP device " << device << "\n";
++                context_device = -1;
++            }
++        }  // spinlock
++    }
++
++    return halide_hip_release_context(user_context);
++}
++
++WEAK int halide_hip_device_malloc(void *user_context, halide_buffer_t *buf) {
++    debug(user_context)
++        << "HIP: halide_hip_device_malloc (user_context: " << user_context
++        << ", buf: " << buf << ")\n";
++
++    Context ctx(user_context);
++    if (ctx.error()) {
++        return ctx.error();
++    }
++
++    size_t size = buf->size_in_bytes();
++    if (halide_can_reuse_device_allocations(user_context)) {
++        size = quantize_allocation_size(size);
++    }
++    halide_abort_if_false(user_context, size != 0);
++    if (buf->device) {
++        // This buffer already has a device allocation
++        return validate_device_pointer(user_context, buf, size);
++    }
++
++    // Check all strides positive.
++    for (int i = 0; i < buf->dimensions; i++) {
++        halide_abort_if_false(user_context, buf->dim[i].stride >= 0);
++    }
++
++    debug(user_context) << "    allocating " << *buf << "\n";
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_before = halide_current_time_ns(user_context);
++#endif
++
++    hipDeviceptr_t p = nullptr;
++    FreeListItem *to_free = nullptr;
++    if (halide_can_reuse_device_allocations(user_context)) {
++        hipStream_t stream = nullptr;
++        auto result = halide_hip_get_stream(user_context, ctx.device, &stream);
++        if (result) {
++            return result;
++        }
++
++        ScopedMutexLock lock(&free_list_lock);
++        // Best-fit allocation. There are three tunable constants
++        // here. A bucket is claimed if the size requested is at least
++        // 7/8 of the size of the bucket. We keep at most 32 unused
++        // allocations. We round up each allocation size to its top 4
++        // most significant bits (see quantize_allocation_size).
++        FreeListItem *best = nullptr, *item = free_list;
++        FreeListItem **best_prev = nullptr, **prev_ptr = &free_list;
++        int depth = 0;
++        while (item) {
++            if ((size <= item->size) &&                              // Fits
++                (size >= (item->size / 8) * 7) &&                    // Not too much slop
++                (ctx.device == item->device) &&                      // Same device
++                (stream == item->stream) &&                          // Can only safely re-use on the same stream on which it was freed
++                ((best == nullptr) || (best->size > item->size))) {  // Better than previous best fit
++                best = item;
++                best_prev = prev_ptr;
++                prev_ptr = &item->next;
++                item = item->next;
++            } else if (depth > 32) {
++                // Allocations after here have not been used for a
++                // long time. Just detach the rest of the free list
++                // and defer the actual hipFree calls until after we
++                // release the free_list_lock.
++                to_free = item;
++                *prev_ptr = nullptr;
++                item = nullptr;
++                break;
++            } else {
++                prev_ptr = &item->next;
++                item = item->next;
++            }
++            depth++;
++        }
++
++        if (best) {
++            p = best->ptr;
++            *best_prev = best->next;
++            free(best);
++        }
++    }
++
++    while (to_free) {
++        FreeListItem *next = to_free->next;
++        hipFree(to_free->ptr);
++        free(to_free);
++        to_free = next;
++    }
++
++    if (!p) {
++        debug(user_context) << "    hipMalloc " << (uint64_t)size << " -> ";
++
++        // Quantize all allocation sizes to the top 4 bits, to make
++        // reuse likelier. Wastes on average 4% memory per allocation.
++
++        hipError_t err = hipMalloc((void **)&p, size);
++        if (err == hipErrorOutOfMemory) {
++            auto result = halide_hip_release_unused_device_allocations(user_context);
++            if (result) {
++                return result;
++            }
++            err = hipMalloc((void **)&p, size);
++        }
++        if (err != hipSuccess) {
++            return error_hip(user_context, err, "hipMalloc failed");
++        }
++        debug(user_context) << (void *)p << "\n";
++    }
++    halide_abort_if_false(user_context, p);
++    buf->device = (uint64_t)(uintptr_t)p;
++    buf->device_interface = &hip_device_interface;
++    buf->device_interface->impl->use_module();
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_after = halide_current_time_ns(user_context);
++    debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
++#endif
++
++    return halide_error_code_success;
++}
++
++namespace {
++
++// Try to perform the (d+1)-dimensional copy described by c (innermost chunk
++// plus d strided dimensions, d <= 2) with a single hipDrvMemcpy3D. Returns
++// false (without touching anything) when the strides cannot be expressed as
++// pitch/height, in which case the caller falls back to recursion.
++WEAK bool hip_try_memcpy3d(void *user_context, const device_copy &c,
++                           uint64_t src, uint64_t dst, int d, bool from_host, bool to_host,
++                           hipStream_t stream, hipError_t &err) {
++    if (d < 1 || d > 2 || hipDrvMemcpy3D == nullptr) {
++        return false;
++    }
++    if (from_host && to_host) {
++        return false;  // plain memcpy handles this
++    }
++    if (env_flag_set(env_disable_memcpy3d, "HL_HIP_DISABLE_MEMCPY3D")) {
++        return false;
++    }
++
++    const uint64_t src_pitch = c.src_stride_bytes[0];
++    const uint64_t dst_pitch = c.dst_stride_bytes[0];
++    if (src_pitch < c.chunk_size || dst_pitch < c.chunk_size) {
++        return false;  // overlapping / broadcast rows: let the 1-D path handle it
++    }
++    uint64_t src_height = c.extent[0];
++    uint64_t dst_height = c.extent[0];
++    uint64_t depth = 1;
++    if (d == 2) {
++        // Slices must be a whole number of rows apart in both src and dst.
++        if (c.src_stride_bytes[1] == 0 || c.dst_stride_bytes[1] == 0 ||
++            c.src_stride_bytes[1] % src_pitch != 0 || c.dst_stride_bytes[1] % dst_pitch != 0) {
++            return false;
++        }
++        src_height = c.src_stride_bytes[1] / src_pitch;
++        dst_height = c.dst_stride_bytes[1] / dst_pitch;
++        if (src_height < c.extent[0] || dst_height < c.extent[0]) {
++            return false;
++        }
++        depth = c.extent[1];
++    }
++
++    HIP_MEMCPY3D copy;
++    memset(&copy, 0, sizeof(copy));
++    if (from_host) {
++        copy.srcMemoryType = hipMemoryTypeHost;
++        copy.srcHost = (const void *)(uintptr_t)src;
++    } else {
++        copy.srcMemoryType = hipMemoryTypeDevice;
++        copy.srcDevice = (hipDeviceptr_t)(uintptr_t)src;
++    }
++    copy.srcPitch = src_pitch;
++    copy.srcHeight = src_height;
++    if (to_host) {
++        copy.dstMemoryType = hipMemoryTypeHost;
++        copy.dstHost = (void *)(uintptr_t)dst;
++    } else {
++        copy.dstMemoryType = hipMemoryTypeDevice;
++        copy.dstDevice = (hipDeviceptr_t)(uintptr_t)dst;
++    }
++    copy.dstPitch = dst_pitch;
++    copy.dstHeight = dst_height;
++    copy.WidthInBytes = c.chunk_size;
++    copy.Height = c.extent[0];
++    copy.Depth = depth;
++
++    debug(user_context) << "    hipDrvMemcpy3D"
++                        << (stream && hipDrvMemcpy3DAsync ? "Async" : "")
++                        << " from " << (from_host ? "host" : "device")
++                        << " to " << (to_host ? "host" : "device") << ", "
++                        << (void *)(uintptr_t)src << " -> " << (void *)(uintptr_t)dst
++                        << ", width " << c.chunk_size << " bytes x " << c.extent[0]
++                        << " rows x " << depth << " slices (pitch " << src_pitch << "/" << dst_pitch << ")\n";
++    if (stream && hipDrvMemcpy3DAsync) {
++        err = hipDrvMemcpy3DAsync(&copy, stream);
++    } else {
++        err = hipDrvMemcpy3D(&copy);
++    }
++    return true;
++}
++
++WEAK int hip_do_multidimensional_copy(void *user_context, const device_copy &c,
++                                      uint64_t src, uint64_t dst, int d, bool from_host, bool to_host,
++                                      hipStream_t stream) {
++    if (d > MAX_COPY_DIMS) {
++        error(user_context) << "Buffer has too many dimensions to copy to/from GPU\n";
++        return halide_error_code_bad_dimensions;
++    } else if (d == 0) {
++        hipError_t err = hipSuccess;
++        const char *copy_name;
++        debug(user_context) << "    from " << (from_host ? "host" : "device")
++                            << " to " << (to_host ? "host" : "device") << ", "
++                            << (void *)(uintptr_t)src << " -> " << (void *)(uintptr_t)dst << ", " << c.chunk_size << " bytes\n";
++        if (!from_host && to_host) {
++            debug(user_context) << "hipMemcpyDtoH(" << (void *)(uintptr_t)dst << ", " << (void *)(uintptr_t)src << ", " << c.chunk_size << ")\n";
++            copy_name = "hipMemcpyDtoH";
++            if (stream) {
++                err = hipMemcpyDtoHAsync((void *)(uintptr_t)dst, (hipDeviceptr_t)(uintptr_t)src, c.chunk_size, stream);
++            } else {
++                err = hipMemcpyDtoH((void *)(uintptr_t)dst, (hipDeviceptr_t)(uintptr_t)src, c.chunk_size);
++            }
++        } else if (from_host && !to_host) {
++            debug(user_context) << "hipMemcpyHtoD(" << (void *)(uintptr_t)dst << ", " << (void *)(uintptr_t)src << ", " << c.chunk_size << ")\n";
++            copy_name = "hipMemcpyHtoD";
++            if (stream) {
++                err = hipMemcpyHtoDAsync((hipDeviceptr_t)(uintptr_t)dst, (const void *)(uintptr_t)src, c.chunk_size, stream);
++            } else {
++                err = hipMemcpyHtoD((hipDeviceptr_t)(uintptr_t)dst, (const void *)(uintptr_t)src, c.chunk_size);
++            }
++        } else if (!from_host && !to_host) {
++            debug(user_context) << "hipMemcpyDtoD(" << (void *)(uintptr_t)dst << ", " << (void *)(uintptr_t)src << ", " << c.chunk_size << ")\n";
++            copy_name = "hipMemcpyDtoD";
++            if (stream) {
++                err = hipMemcpyDtoDAsync((hipDeviceptr_t)(uintptr_t)dst, (hipDeviceptr_t)(uintptr_t)src, c.chunk_size, stream);
++            } else {
++                err = hipMemcpyDtoD((hipDeviceptr_t)(uintptr_t)dst, (hipDeviceptr_t)(uintptr_t)src, c.chunk_size);
++            }
++        } else if (dst != src) {
++            debug(user_context) << "memcpy(" << (void *)(uintptr_t)dst << ", " << (void *)(uintptr_t)src << ", " << c.chunk_size << ")\n";
++            // Could reach here if a user called directly into the
++            // HIP API for a device->host copy on a source buffer
++            // with device_dirty = false.
++            memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, c.chunk_size);
++        }
++        if (err != hipSuccess) {
++            return error_hip(user_context, err, copy_name, " failed");
++        }
++    } else {
++        // Up to two strided dimensions can be done as one 3D copy.
++        hipError_t err = hipSuccess;
++        if (hip_try_memcpy3d(user_context, c, src, dst, d, from_host, to_host, stream, err)) {
++            if (err != hipSuccess) {
++                return error_hip(user_context, err, "hipDrvMemcpy3D failed");
++            }
++            return halide_error_code_success;
++        }
++
++        ssize_t src_off = 0, dst_off = 0;
++        for (int i = 0; i < (int)c.extent[d - 1]; i++) {
++            auto result = hip_do_multidimensional_copy(user_context, c, src + src_off, dst + dst_off, d - 1, from_host, to_host, stream);
++            dst_off += c.dst_stride_bytes[d - 1];
++            src_off += c.src_stride_bytes[d - 1];
++            if (result) {
++                return result;
++            }
++        }
++    }
++    return halide_error_code_success;
++}
++}  // namespace
++
++WEAK int halide_hip_buffer_copy(void *user_context, struct halide_buffer_t *src,
++                                const struct halide_device_interface_t *dst_device_interface,
++                                struct halide_buffer_t *dst) {
++    // We only handle copies to hip or to host
++    halide_abort_if_false(user_context, dst_device_interface == nullptr ||
++                                            dst_device_interface == &hip_device_interface);
++
++    if ((src->device_dirty() || src->host == nullptr) &&
++        src->device_interface != &hip_device_interface) {
++        halide_abort_if_false(user_context, dst_device_interface == &hip_device_interface);
++        // This is handled at the higher level.
++        return halide_error_code_incompatible_device_interface;
++    }
++
++    bool from_host = (src->device_interface != &hip_device_interface) ||
++                     (src->device == 0) ||
++                     (src->host_dirty() && src->host != nullptr);
++    bool to_host = !dst_device_interface;
++
++    halide_abort_if_false(user_context, from_host || src->device);
++    halide_abort_if_false(user_context, to_host || dst->device);
++
++    device_copy c = make_buffer_copy(src, from_host, dst, to_host);
++
++    {
++        Context ctx(user_context);
++        if (ctx.error()) {
++            return ctx.error();
++        }
++
++        debug(user_context)
++            << "HIP: halide_hip_buffer_copy (user_context: " << user_context
++            << ", src: " << src << ", dst: " << dst << ")\n";
++
++#ifdef DEBUG_RUNTIME
++        uint64_t t_before = halide_current_time_ns(user_context);
++        if (!from_host) {
++            auto result = validate_device_pointer(user_context, src);
++            if (result) {
++                return result;
++            }
++        }
++        if (!to_host) {
++            auto result = validate_device_pointer(user_context, dst);
++            if (result) {
++                return result;
++            }
++        }
++#endif
++
++        hipStream_t stream = nullptr;
++        auto result = halide_hip_get_stream(user_context, ctx.device, &stream);
++        if (result) {
++            return result;
++        }
++
++        result = hip_do_multidimensional_copy(
++            user_context, c, c.src + c.src_begin, c.dst + c.dst_begin,
++            dst->dimensions, from_host, to_host, stream);
++        if (result) {
++            return result;
++        }
++
++#ifdef DEBUG_RUNTIME
++        uint64_t t_after = halide_current_time_ns(user_context);
++        debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
++#endif
++    }
++
++    return halide_error_code_success;
++}
++
++namespace {
++
++WEAK int hip_device_crop_from_offset(const struct halide_buffer_t *src,
++                                     int64_t offset,
++                                     struct halide_buffer_t *dst) {
++    dst->device = src->device + offset;
++    dst->device_interface = src->device_interface;
++    dst->set_device_dirty(src->device_dirty());
++    return halide_error_code_success;
++}
++
++}  // namespace
++
++WEAK int halide_hip_device_crop(void *user_context, const struct halide_buffer_t *src,
++                                struct halide_buffer_t *dst) {
++    debug(user_context)
++        << "HIP: halide_hip_device_crop (user_context: " << user_context
++        << ", src: " << src << ", dst: " << dst << ")\n";
++
++    // Pointer arithmetic works fine.
++    const int64_t offset = calc_device_crop_byte_offset(src, dst);
++    return hip_device_crop_from_offset(src, offset, dst);
++}
++
++WEAK int halide_hip_device_slice(void *user_context, const struct halide_buffer_t *src,
++                                 int slice_dim, int slice_pos,
++                                 struct halide_buffer_t *dst) {
++    debug(user_context)
++        << "HIP: halide_hip_device_slice (user_context: " << user_context
++        << ", src: " << src << ", slice_dim " << slice_dim << ", slice_pos "
++        << slice_pos << ", dst: " << dst << ")\n";
++
++    // Pointer arithmetic works fine.
++    const int64_t offset = calc_device_slice_byte_offset(src, slice_dim, slice_pos);
++    return hip_device_crop_from_offset(src, offset, dst);
++}
++
++WEAK int halide_hip_device_release_crop(void *user_context, struct halide_buffer_t *dst) {
++    debug(user_context)
++        << "HIP: halide_hip_release_crop (user_context: " << user_context
++        << ", dst: " << dst << ")\n";
++    return halide_error_code_success;
++}
++
++WEAK int halide_hip_copy_to_device(void *user_context, halide_buffer_t *buf) {
++    return halide_hip_buffer_copy(user_context, buf, &hip_device_interface, buf);
++}
++
++WEAK int halide_hip_copy_to_host(void *user_context, halide_buffer_t *buf) {
++    return halide_hip_buffer_copy(user_context, buf, nullptr, buf);
++}
++
++// Used to generate correct timings when tracing
++WEAK int halide_hip_device_sync(void *user_context, struct halide_buffer_t *) {
++    debug(user_context)
++        << "HIP: halide_hip_device_sync (user_context: " << user_context << ")\n";
++
++    Context ctx(user_context);
++    if (ctx.error()) {
++        return ctx.error();
++    }
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_before = halide_current_time_ns(user_context);
++#endif
++
++    hipStream_t stream = nullptr;
++    auto result = halide_hip_get_stream(user_context, ctx.device, &stream);
++    if (result) {
++        return result;
++    }
++    // Synchronizing the null stream waits for all work Halide enqueued on it;
++    // a user-provided stream is synchronized on its own.
++    hipError_t err = hipStreamSynchronize(stream);
++    if (err != hipSuccess) {
++        return error_hip(user_context, err, "hipStreamSynchronize failed");
++    }
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_after = halide_current_time_ns(user_context);
++    debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
++#endif
++
++    return halide_error_code_success;
++}
++
++WEAK int halide_hip_run(void *user_context,
++                        void *state_ptr,
++                        const char *entry_name,
++                        int blocksX, int blocksY, int blocksZ,
++                        int threadsX, int threadsY, int threadsZ,
++                        int shared_mem_bytes,
++                        size_t arg_sizes[],
++                        void *args[],
++                        int8_t arg_is_buffer[]) {
++
++    debug(user_context) << "HIP: halide_hip_run ("
++                        << "user_context: " << user_context << ", "
++                        << "entry: " << entry_name << ", "
++                        << "blocks: " << blocksX << "x" << blocksY << "x" << blocksZ << ", "
++                        << "threads: " << threadsX << "x" << threadsY << "x" << threadsZ << ", "
++                        << "shmem: " << shared_mem_bytes << "\n";
++
++    hipError_t err;
++    Context ctx(user_context);
++    if (ctx.error()) {
++        return ctx.error();
++    }
++
++    debug(user_context) << "Got device " << ctx.device << ".\n";
++
++#ifdef DEBUG_RUNTIME
++    uint64_t t_before = halide_current_time_ns(user_context);
++#endif
++
++    hipModule_t mod{};
++    bool found = compilation_cache.lookup(ctx.cache_key(), state_ptr, mod);
++    halide_abort_if_false(user_context, found && mod != nullptr);
++
++    debug(user_context) << "Got module " << (void *)mod << "\n";
++    hipFunction_t f;
++    err = hipModuleGetFunction(&f, mod, entry_name);
++    debug(user_context) << "Got function " << (void *)f << "\n";
++    if (err != hipSuccess) {
++        return error_hip(user_context, err, "hipModuleGetFunction failed for kernel ", entry_name,
++                         " (is the kernel symbol exported from the code object?)");
++    }
++
++    size_t num_args = 0;
++    while (arg_sizes[num_args] != 0) {
++        debug(user_context) << "    halide_hip_run " << (int)num_args
++                            << " " << (int)arg_sizes[num_args]
++                            << " [" << (*((void **)args[num_args])) << " ...] "
++                            << arg_is_buffer[num_args] << "\n";
++        num_args++;
++    }
++
++    // We need storage for both the arg and the pointer to it if if
++    // has to be translated.
++    void **translated_args = (void **)malloc((num_args + 1) * sizeof(void *));
++    uint64_t *dev_handles = (uint64_t *)malloc(num_args * sizeof(uint64_t));
++    for (size_t i = 0; i <= num_args; i++) {  // Get nullptr at end.
++        if (arg_is_buffer[i]) {
++            halide_abort_if_false(user_context, arg_sizes[i] == sizeof(uint64_t));
++            dev_handles[i] = ((halide_buffer_t *)args[i])->device;
++            translated_args[i] = &(dev_handles[i]);
++            debug(user_context) << "    halide_hip_run translated arg" << (int)i
++                                << " [" << (*((void **)translated_args[i])) << " ...]\n";
++        } else {
++            translated_args[i] = args[i];
++        }
++    }
++
++    hipStream_t stream = nullptr;
++    if (auto result = halide_hip_get_stream(user_context, ctx.device, &stream);
++        result != halide_error_code_success) {
++        error(user_context) << "HIP: In halide_hip_run, halide_hip_get_stream returned " << result << "\n";
++        free(dev_handles);
++        free(translated_args);
++        return result;
++    }
++
++    // Default path: hand hipModuleLaunchKernel the per-argument pointers and
++    // let it pack the kernarg segment from the code object's .args metadata
++    // (identical contract to cuLaunchKernel).
++    void **kernel_params = translated_args;
++    void **extra = nullptr;
++
++    // Debug path (HL_HIP_PACK_KERNARGS=1): pack the explicit arguments
++    // ourselves with natural alignment (buffers are 8-byte pointers, scalars
++    // use their own size) and pass the blob via `extra`. This bypasses HIP's
++    // metadata-driven packing and is only meant for diagnosing kernarg ABI
++    // mismatches; the code object's .args[].offset values remain the
++    // authoritative layout.
++    uint8_t *packed = nullptr;
++    size_t packed_size = 0;
++    void *extra_list[5];
++    if (env_flag_set(env_pack_kernargs, "HL_HIP_PACK_KERNARGS")) {
++        size_t offset = 0;
++        for (size_t i = 0; i < num_args; i++) {
++            size_t sz = arg_is_buffer[i] ? sizeof(uint64_t) : arg_sizes[i];
++            size_t al = sz < 16 ? sz : 16;
++            if (al == 0) {
++                al = 1;
++            }
++            offset = align_up(offset, al) + sz;
++        }
++        packed_size = align_up(offset, (size_t)16);
++        if (packed_size == 0) {
++            packed_size = 16;
++        }
++        packed = (uint8_t *)malloc(packed_size);
++        memset(packed, 0, packed_size);
++        offset = 0;
++        for (size_t i = 0; i < num_args; i++) {
++            size_t sz = arg_is_buffer[i] ? sizeof(uint64_t) : arg_sizes[i];
++            size_t al = sz < 16 ? sz : 16;
++            if (al == 0) {
++                al = 1;
++            }
++            offset = align_up(offset, al);
++            memcpy(packed + offset, translated_args[i], sz);
++            debug(user_context) << "    halide_hip_run packed arg" << (int)i
++                                << " at offset " << (int)offset << " size " << (int)sz << "\n";
++            offset += sz;
++        }
++        extra_list[0] = HIP_LAUNCH_PARAM_BUFFER_POINTER;
++        extra_list[1] = packed;
++        extra_list[2] = HIP_LAUNCH_PARAM_BUFFER_SIZE;
++        extra_list[3] = &packed_size;
++        extra_list[4] = HIP_LAUNCH_PARAM_END;
++        kernel_params = nullptr;
++        extra = extra_list;
++        debug(user_context) << "    halide_hip_run using packed kernargs (" << (int)packed_size << " bytes)\n";
++    }
++
++    err = hipModuleLaunchKernel(f,
++                                blocksX, blocksY, blocksZ,
++                                threadsX, threadsY, threadsZ,
++                                shared_mem_bytes,
++                                stream,
++                                kernel_params,
++                                extra);
++    free(packed);
++    free(dev_handles);
++    free(translated_args);
++    if (err != hipSuccess) {
++        return error_hip(user_context, err, "hipModuleLaunchKernel failed");
++    }
++
++#ifdef DEBUG_RUNTIME
++    err = hipDeviceSynchronize();
++    if (err != hipSuccess) {
++        return error_hip(user_context, err, "hipDeviceSynchronize failed");
++    }
++    uint64_t t_after = halide_current_time_ns(user_context);
++    debug(user_context) << "    Time: " << (t_after - t_before) / 1.0e6 << " ms\n";
++#endif
++    return halide_error_code_success;
++}
++
++WEAK int halide_hip_device_and_host_malloc(void *user_context, struct halide_buffer_t *buf) {
++    return halide_default_device_and_host_malloc(user_context, buf, &hip_device_interface);
++}
++
++WEAK int halide_hip_device_and_host_free(void *user_context, struct halide_buffer_t *buf) {
++    return halide_default_device_and_host_free(user_context, buf, &hip_device_interface);
++}
++
++WEAK int halide_hip_wrap_device_ptr(void *user_context, struct halide_buffer_t *buf, uint64_t device_ptr) {
++    halide_abort_if_false(user_context, buf->device == 0);
++    if (buf->device != 0) {
++        error(user_context) << "halide_hip_wrap_device_ptr: device field is already non-zero";
++        return halide_error_code_generic_error;
++    }
++    buf->device = device_ptr;
++    buf->device_interface = &hip_device_interface;
++    buf->device_interface->impl->use_module();
++#ifdef DEBUG_RUNTIME
++    if (auto result = validate_device_pointer(user_context, buf);
++        result != halide_error_code_success) {
++        buf->device_interface->impl->release_module();
++        buf->device = 0;
++        buf->device_interface = nullptr;
++        return result;
++    }
++#endif
++    return halide_error_code_success;
++}
++
++WEAK int halide_hip_detach_device_ptr(void *user_context, struct halide_buffer_t *buf) {
++    if (buf->device == 0) {
++        return halide_error_code_success;
++    }
++    halide_abort_if_false(user_context, buf->device_interface == &hip_device_interface);
++    buf->device_interface->impl->release_module();
++    buf->device = 0;
++    buf->device_interface = nullptr;
++    return halide_error_code_success;
++}
++
++WEAK uintptr_t halide_hip_get_device_ptr(void *user_context, struct halide_buffer_t *buf) {
++    if (buf->device == 0) {
++        return halide_error_code_success;
++    }
++    halide_abort_if_false(user_context, buf->device_interface == &hip_device_interface);
++    return (uintptr_t)buf->device;
++}
++
++WEAK const halide_device_interface_t *halide_hip_device_interface() {
++    return &hip_device_interface;
++}
++
++WEAK int halide_hip_compute_capability(void *user_context, int *major, int *minor) {
++    if (!lib_hip && !hipInit) {
++        // If HIP can't be found, we want to return 0, 0 and it's not
++        // considered an error. So we should be very careful about
++        // looking for libamdhip64 without tripping any errors in the rest
++        // of this runtime.
++        void *sym = halide_hip_get_symbol(user_context, "hipInit");
++        if (!sym) {
++            *major = *minor = 0;
++            return halide_error_code_success;
++        }
++    }
++
++    {
++        Context ctx(user_context);
++        if (ctx.error()) {
++            return ctx.error();
++        }
++
++        auto result = get_hip_arch(user_context, ctx.device, major, minor);
++        if (result) {
++            return result;
++        }
++    }
++
++    return halide_error_code_success;
++}
++
++namespace {
++WEAK __attribute__((destructor)) void halide_hip_cleanup() {
++    compilation_cache.release_all(nullptr, hipModuleUnload);
++    (void)halide_hip_device_release(nullptr);  // ignore error
++}
++}  // namespace
++
++}  // extern "C" linkage
++
++namespace Halide {
++namespace Runtime {
++namespace Internal {
++namespace Hip {
++
++ALWAYS_INLINE int hex_digit_value(char c) {
++    if (c >= '0' && c <= '9') {
++        return c - '0';
++    }
++    if (c >= 'a' && c <= 'f') {
++        return c - 'a' + 10;
++    }
++    if (c >= 'A' && c <= 'F') {
++        return c - 'A' + 10;
++    }
++    return -1;
++}
++
++// Parse the digits following "gfx" in a target id ("gfx942", "gfx90a",
++// "gfx1100:sramecc+:xnack-", ...) into Halide's (major, minor) encoding:
++// major = decimal value of all but the last two characters, minor = last two
++// characters as hex. Returns false if the string is not of that form.
++WEAK bool parse_gfx_id(const char *s, int *major, int *minor) {
++    int digits[8];
++    int n = 0;
++    while (n < 8 && hex_digit_value(s[n]) >= 0) {
++        digits[n] = hex_digit_value(s[n]);
++        n++;
++    }
++    if (n < 3 || n > 6) {
++        return false;
++    }
++    int maj = 0;
++    for (int i = 0; i < n - 2; i++) {
++        if (digits[i] > 9) {
++            return false;  // the generation is always decimal
++        }
++        maj = maj * 10 + digits[i];
++    }
++    *major = maj;
++    *minor = digits[n - 2] * 16 + digits[n - 1];
++    return true;
++}
++
++// Determine the device's gfx ISA id in Halide's (major, minor) encoding.
++//
++// 1. gcnArchName from hipGetDeviceProperties. On ROCm >= 6 the exported symbol
++//    is hipGetDevicePropertiesR0600 (the unversioned name is kept for the
++//    ROCm 5 ABI); on ROCm 5.x only hipGetDeviceProperties exists. The struct
++//    layout differs between the two, so it is treated as opaque: the call
++//    fills a zeroed, generously oversized buffer and we scan it for
++//    "gfx<hex digits>". gcnArchName is the only string in the struct that
++//    contains a gfx id (the marketing name precedes it in both layouts).
++// 2. hipDeviceAttributeGcnArch (ROCm 5.x only; hipErrorInvalidValue on
++//    ROCm 6+): the driver computes it as major*100 + minor*10 + stepping
++//    (hip_device.cpp), where a letter stepping is >= 10, so gfx90a is 910 and
++//    gfx90c is 912. Those two are decoded explicitly; everything else is
++//    (N/100, ((N/10)%10) << 4 | N%10), e.g. 942 -> (9, 0x42), 1100 -> (11, 0).
++// 3. hipDeviceComputeCapability returns only the ISA major/minor (gfx942 ->
++//    9.4, gfx90a -> 9.0, indistinguishable from gfx900). The stepping is
++//    reported as 0 (gfx942 -> (9, 0x40)); Target.cpp will not find a matching
++//    hip_gfx* feature and will ask the user for HL_HIP_ARCH.
++WEAK int get_hip_arch(void *user_context, int device, int *major, int *minor) {
++    *major = 0;
++    *minor = 0;
++
++    // 1. gcnArchName.
++    if (hipGetDevicePropertiesR0600 != nullptr || hipGetDeviceProperties != nullptr) {
++        // hipDeviceProp_t is ~1.5 KB in ROCm 5 and ROCm 6/7 (three char[256]
++        // fields plus ~100 scalars); 64 KB leaves ample headroom for growth.
++        const size_t props_size = 64 * 1024;
++        char *props = (char *)malloc(props_size);
++        if (props) {
++            memset(props, 0, props_size);
++            hipError_t err;
++            const char *fn_name;
++            if (hipGetDevicePropertiesR0600 != nullptr) {
++                fn_name = "hipGetDevicePropertiesR0600";
++                err = hipGetDevicePropertiesR0600((hipDeviceProp_t *)props, device);
++            } else {
++                fn_name = "hipGetDeviceProperties";
++                err = hipGetDeviceProperties((hipDeviceProp_t *)props, device);
++            }
++            bool found = false;
++            if (err == hipSuccess) {
++                for (size_t i = 0; i + 4 <= props_size; i++) {
++                    if (props[i] == 'g' && props[i + 1] == 'f' && props[i + 2] == 'x' &&
++                        parse_gfx_id(props + i + 3, major, minor)) {
++                        debug(user_context) << "    HIP device " << device << " arch from " << fn_name
++                                            << " gcnArchName: gfx" << (props + i + 3) << " -> "
++                                            << *major << "/" << *minor << "\n";
++                        found = true;
++                        break;
++                    }
++                }
++                if (!found) {
++                    debug(user_context) << "    " << fn_name << " returned no gfx id\n";
++                }
++            } else {
++                debug(user_context) << "    " << fn_name << " failed: " << get_hip_error_name(err) << "\n";
++            }
++            free(props);
++            if (found) {
++                return halide_error_code_success;
++            }
++        }
++    }
++
++    // 2. ROCm 5.x hipDeviceAttributeGcnArch.
++    {
++        int gcn_arch = 0;
++        hipError_t err = hipDeviceGetAttribute(&gcn_arch, hipDeviceAttributeGcnArch, device);
++        if (err == hipSuccess && gcn_arch >= 100) {
++            if (gcn_arch == 910) {
++                *major = 9;
++                *minor = 0x0a;  // gfx90a
++            } else if (gcn_arch == 912) {
++                *major = 9;
++                *minor = 0x0c;  // gfx90c
++            } else {
++                *major = gcn_arch / 100;
++                *minor = (((gcn_arch / 10) % 10) << 4) | (gcn_arch % 10);
++            }
++            debug(user_context) << "    HIP device " << device << " arch from hipDeviceAttributeGcnArch: "
++                                << gcn_arch << " -> " << *major << "/" << *minor << "\n";
++            return halide_error_code_success;
++        }
++        debug(user_context) << "    hipDeviceAttributeGcnArch unavailable (" << get_hip_error_name(err) << ")\n";
++    }
++
++    // 3. Lossy fallback: ISA major/minor only.
++    {
++        int isa_major = 0, isa_minor = 0;
++        hipError_t err = hipDeviceComputeCapability(&isa_major, &isa_minor, device);
++        if (err != hipSuccess) {
++            return error_hip(user_context, err, "hipDeviceComputeCapability failed");
++        }
++        *major = isa_major;
++        *minor = (isa_minor & 0xf) << 4;
++        debug(user_context) << "    HIP device " << device << " arch from hipDeviceComputeCapability: "
++                            << isa_major << "." << isa_minor << " -> " << *major << "/" << *minor
++                            << " (stepping unknown; set HL_HIP_ARCH=gfxNNNN)\n";
++    }
++    return halide_error_code_success;
++}
++
++WEAK const char *get_hip_error_name(hipError_t err) {
++    // Errors with Halide-specific meaning first; then the runtime's own
++    // table when we have it; then our static table.
++    switch (err) {
++    // A trap instruction (s_trap 2, from llvm.trap) surfaces as a launch
++    // failure on the next synchronization, which is how we codegen asserts on GPU.
++    case hipErrorLaunchFailure:
++        return "hipErrorLaunchFailure: illegal instruction or Halide assertion failure inside kernel";
++    case hipErrorNoBinaryForGpu:
++        return "hipErrorNoBinaryForGpu: code object does not match the device architecture";
++    default:
++        break;
++    }
++
++    if (hipGetErrorName != nullptr) {
++        const char *name = hipGetErrorName(err);
++        if (name) {
++            return name;
++        }
++    }
++
++    switch (err) {
++    case hipSuccess:
++        return "hipSuccess";
++    case hipErrorInvalidValue:
++        return "hipErrorInvalidValue";
++    case hipErrorOutOfMemory:
++        return "hipErrorOutOfMemory";
++    case hipErrorNotInitialized:
++        return "hipErrorNotInitialized";
++    case hipErrorDeinitialized:
++        return "hipErrorDeinitialized";
++    case hipErrorProfilerDisabled:
++        return "hipErrorProfilerDisabled";
++    case hipErrorProfilerNotInitialized:
++        return "hipErrorProfilerNotInitialized";
++    case hipErrorProfilerAlreadyStarted:
++        return "hipErrorProfilerAlreadyStarted";
++    case hipErrorProfilerAlreadyStopped:
++        return "hipErrorProfilerAlreadyStopped";
++    case hipErrorInvalidConfiguration:
++        return "hipErrorInvalidConfiguration";
++    case hipErrorInvalidPitchValue:
++        return "hipErrorInvalidPitchValue";
++    case hipErrorInvalidSymbol:
++        return "hipErrorInvalidSymbol";
++    case hipErrorInvalidDevicePointer:
++        return "hipErrorInvalidDevicePointer";
++    case hipErrorInvalidMemcpyDirection:
++        return "hipErrorInvalidMemcpyDirection";
++    case hipErrorInsufficientDriver:
++        return "hipErrorInsufficientDriver";
++    case hipErrorMissingConfiguration:
++        return "hipErrorMissingConfiguration";
++    case hipErrorPriorLaunchFailure:
++        return "hipErrorPriorLaunchFailure";
++    case hipErrorInvalidDeviceFunction:
++        return "hipErrorInvalidDeviceFunction";
++    case hipErrorNoDevice:
++        return "hipErrorNoDevice";
++    case hipErrorInvalidDevice:
++        return "hipErrorInvalidDevice";
++    case hipErrorInvalidImage:
++        return "hipErrorInvalidImage";
++    case hipErrorInvalidContext:
++        return "hipErrorInvalidContext";
++    case hipErrorContextAlreadyCurrent:
++        return "hipErrorContextAlreadyCurrent";
++    case hipErrorMapFailed:
++        return "hipErrorMapFailed";
++    case hipErrorUnmapFailed:
++        return "hipErrorUnmapFailed";
++    case hipErrorArrayIsMapped:
++        return "hipErrorArrayIsMapped";
++    case hipErrorAlreadyMapped:
++        return "hipErrorAlreadyMapped";
++    case hipErrorAlreadyAcquired:
++        return "hipErrorAlreadyAcquired";
++    case hipErrorNotMapped:
++        return "hipErrorNotMapped";
++    case hipErrorNotMappedAsArray:
++        return "hipErrorNotMappedAsArray";
++    case hipErrorNotMappedAsPointer:
++        return "hipErrorNotMappedAsPointer";
++    case hipErrorECCNotCorrectable:
++        return "hipErrorECCNotCorrectable";
++    case hipErrorUnsupportedLimit:
++        return "hipErrorUnsupportedLimit";
++    case hipErrorContextAlreadyInUse:
++        return "hipErrorContextAlreadyInUse";
++    case hipErrorPeerAccessUnsupported:
++        return "hipErrorPeerAccessUnsupported";
++    case hipErrorInvalidKernelFile:
++        return "hipErrorInvalidKernelFile";
++    case hipErrorInvalidGraphicsContext:
++        return "hipErrorInvalidGraphicsContext";
++    case hipErrorInvalidSource:
++        return "hipErrorInvalidSource";
++    case hipErrorFileNotFound:
++        return "hipErrorFileNotFound";
++    case hipErrorSharedObjectSymbolNotFound:
++        return "hipErrorSharedObjectSymbolNotFound";
++    case hipErrorSharedObjectInitFailed:
++        return "hipErrorSharedObjectInitFailed";
++    case hipErrorOperatingSystem:
++        return "hipErrorOperatingSystem";
++    case hipErrorInvalidHandle:
++        return "hipErrorInvalidHandle";
++    case hipErrorIllegalState:
++        return "hipErrorIllegalState";
++    case hipErrorNotFound:
++        return "hipErrorNotFound";
++    case hipErrorNotReady:
++        return "hipErrorNotReady";
++    case hipErrorIllegalAddress:
++        return "hipErrorIllegalAddress";
++    case hipErrorLaunchOutOfResources:
++        return "hipErrorLaunchOutOfResources";
++    case hipErrorLaunchTimeOut:
++        return "hipErrorLaunchTimeOut";
++    case hipErrorPeerAccessAlreadyEnabled:
++        return "hipErrorPeerAccessAlreadyEnabled";
++    case hipErrorPeerAccessNotEnabled:
++        return "hipErrorPeerAccessNotEnabled";
++    case hipErrorSetOnActiveProcess:
++        return "hipErrorSetOnActiveProcess";
++    case hipErrorContextIsDestroyed:
++        return "hipErrorContextIsDestroyed";
++    case hipErrorAssert:
++        return "hipErrorAssert";
++    case hipErrorHostMemoryAlreadyRegistered:
++        return "hipErrorHostMemoryAlreadyRegistered";
++    case hipErrorHostMemoryNotRegistered:
++        return "hipErrorHostMemoryNotRegistered";
++    case hipErrorCooperativeLaunchTooLarge:
++        return "hipErrorCooperativeLaunchTooLarge";
++    case hipErrorNotSupported:
++        return "hipErrorNotSupported";
++    case hipErrorStreamCaptureUnsupported:
++        return "hipErrorStreamCaptureUnsupported";
++    case hipErrorStreamCaptureInvalidated:
++        return "hipErrorStreamCaptureInvalidated";
++    case hipErrorStreamCaptureMerge:
++        return "hipErrorStreamCaptureMerge";
++    case hipErrorStreamCaptureUnmatched:
++        return "hipErrorStreamCaptureUnmatched";
++    case hipErrorStreamCaptureUnjoined:
++        return "hipErrorStreamCaptureUnjoined";
++    case hipErrorStreamCaptureIsolation:
++        return "hipErrorStreamCaptureIsolation";
++    case hipErrorStreamCaptureImplicit:
++        return "hipErrorStreamCaptureImplicit";
++    case hipErrorCapturedEvent:
++        return "hipErrorCapturedEvent";
++    case hipErrorStreamCaptureWrongThread:
++        return "hipErrorStreamCaptureWrongThread";
++    case hipErrorGraphExecUpdateFailure:
++        return "hipErrorGraphExecUpdateFailure";
++    case hipErrorUnknown:
++        return "hipErrorUnknown";
++    case hipErrorRuntimeMemory:
++        return "hipErrorRuntimeMemory";
++    case hipErrorRuntimeOther:
++        return "hipErrorRuntimeOther";
++    case hipErrorTbd:
++        return "hipErrorTbd";
++    default:
++        return "<Unknown error>";
++    }
++}
++
++WEAK halide_device_interface_impl_t hip_device_interface_impl = {
++    halide_use_jit_module,
++    halide_release_jit_module,
++    halide_hip_device_malloc,
++    halide_hip_device_free,
++    halide_hip_device_sync,
++    halide_hip_device_release,
++    halide_hip_copy_to_host,
++    halide_hip_copy_to_device,
++    halide_hip_device_and_host_malloc,
++    halide_hip_device_and_host_free,
++    halide_hip_buffer_copy,
++    halide_hip_device_crop,
++    halide_hip_device_slice,
++    halide_hip_device_release_crop,
++    halide_hip_wrap_device_ptr,
++    halide_hip_detach_device_ptr,
++};
++
++WEAK halide_device_interface_t hip_device_interface = {
++    halide_device_malloc,
++    halide_device_free,
++    halide_device_sync,
++    halide_device_release,
++    halide_copy_to_host,
++    halide_copy_to_device,
++    halide_device_and_host_malloc,
++    halide_device_and_host_free,
++    halide_buffer_copy,
++    halide_device_crop,
++    halide_device_slice,
++    halide_device_release_crop,
++    halide_device_wrap_native,
++    halide_device_detach_native,
++    halide_hip_compute_capability,
++    &hip_device_interface_impl};
++
++}  // namespace Hip
++}  // namespace Internal
++}  // namespace Runtime
++}  // namespace Halide
+diff --git a/src/runtime/hip_functions.h b/src/runtime/hip_functions.h
+new file mode 100644
+index 0000000..161c074
+--- /dev/null
++++ b/src/runtime/hip_functions.h
+@@ -0,0 +1,67 @@
++// Note that this header intentionally does not use include
++// guards. The intended usage of this file is to define the meaning of
++// the HIP_FN macros, and then include this file, sometimes
++// repeatedly within the same compilation unit. (Mirror of cuda_functions.h.)
++//
++// Prototypes were transcribed verbatim from
++// https://raw.githubusercontent.com/ROCm/HIP/develop/include/hip/hip_runtime_api.h
++// (2026-09-04). All of them live in the single HIP runtime library
++// (libamdhip64.so / amdhip64.dll); there is no separate "driver" library.
++
++#ifndef HIP_FN
++#define HIP_FN(ret, fn, args)
++#endif
++#ifndef HIP_FN_OPTIONAL
++#define HIP_FN_OPTIONAL(ret, fn, args)
++#endif
++
++// Initialization / device enumeration
++HIP_FN(hipError_t, hipInit, (unsigned int flags));
++HIP_FN(hipError_t, hipGetDeviceCount, (int *count));
++HIP_FN(hipError_t, hipDeviceGet, (hipDevice_t * device, int ordinal));
++HIP_FN(hipError_t, hipDeviceGetAttribute, (int *pi, hipDeviceAttribute_t attr, int deviceId));
++HIP_FN(hipError_t, hipDeviceGetName, (char *name, int len, hipDevice_t device));
++HIP_FN(hipError_t, hipDeviceComputeCapability, (int *major, int *minor, hipDevice_t device));
++HIP_FN(hipError_t, hipDeviceTotalMem, (size_t *bytes, hipDevice_t device));
++HIP_FN(hipError_t, hipSetDevice, (int deviceId));
++HIP_FN(hipError_t, hipGetDevice, (int *deviceId));
++HIP_FN(hipError_t, hipDeviceSynchronize, ());
++
++// Modules / kernels
++HIP_FN(hipError_t, hipModuleLoadData, (hipModule_t * module, const void *image));
++HIP_FN(hipError_t, hipModuleUnload, (hipModule_t module));
++HIP_FN(hipError_t, hipModuleGetFunction, (hipFunction_t * function, hipModule_t module, const char *kname));
++HIP_FN(hipError_t, hipModuleLaunchKernel, (hipFunction_t f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, hipStream_t stream, void **kernelParams, void **extra));
++
++// Memory
++HIP_FN(hipError_t, hipMalloc, (void **ptr, size_t size));
++HIP_FN(hipError_t, hipFree, (void *ptr));
++HIP_FN(hipError_t, hipMemcpyHtoD, (hipDeviceptr_t dst, const void *src, size_t sizeBytes));
++HIP_FN(hipError_t, hipMemcpyDtoH, (void *dst, hipDeviceptr_t src, size_t sizeBytes));
++HIP_FN(hipError_t, hipMemcpyDtoD, (hipDeviceptr_t dst, hipDeviceptr_t src, size_t sizeBytes));
++HIP_FN(hipError_t, hipMemcpyHtoDAsync, (hipDeviceptr_t dst, const void *src, size_t sizeBytes, hipStream_t stream));
++HIP_FN(hipError_t, hipMemcpyDtoHAsync, (void *dst, hipDeviceptr_t src, size_t sizeBytes, hipStream_t stream));
++HIP_FN(hipError_t, hipMemcpyDtoDAsync, (hipDeviceptr_t dst, hipDeviceptr_t src, size_t sizeBytes, hipStream_t stream));
++
++// Streams
++HIP_FN(hipError_t, hipStreamSynchronize, (hipStream_t stream));
++
++// Optional: used when present, with fallbacks otherwise.
++HIP_FN_OPTIONAL(const char *, hipGetErrorName, (hipError_t hip_error));
++HIP_FN_OPTIONAL(hipError_t, hipDrvMemcpy3D, (const HIP_MEMCPY3D *pCopy));
++HIP_FN_OPTIONAL(hipError_t, hipDrvMemcpy3DAsync, (const HIP_MEMCPY3D *pCopy, hipStream_t stream));
++HIP_FN_OPTIONAL(hipError_t, hipMemGetInfo, (size_t *free_bytes, size_t *total_bytes));
++// hipPointerAttribute_t is treated as opaque (its layout differs between ROCm 5
++// and 6); hip.cpp only ever looks at the returned error code.
++HIP_FN_OPTIONAL(hipError_t, hipPointerGetAttributes, (hipPointerAttribute_t * attributes, const void *ptr));
++// Device properties are only used to read gcnArchName (see get_hip_arch in
++// hip.cpp). ROCm >= 6.0 exports the versioned symbol (`#define
++// hipGetDeviceProperties hipGetDevicePropertiesR0600` in the public header)
++// and keeps the unversioned one as the ROCm 5 ABI; ROCm 5.x only has the
++// unversioned symbol. hipDeviceProp_t is treated as opaque.
++HIP_FN_OPTIONAL(hipError_t, hipGetDevicePropertiesR0600, (hipDeviceProp_t * prop, int deviceId));
++HIP_FN_OPTIONAL(hipError_t, hipGetDeviceProperties, (hipDeviceProp_t * prop, int deviceId));
++HIP_FN_OPTIONAL(hipError_t, hipRuntimeGetVersion, (int *runtimeVersion));
++
++#undef HIP_FN
++#undef HIP_FN_OPTIONAL
+diff --git a/src/runtime/mini_hip.h b/src/runtime/mini_hip.h
+new file mode 100644
+index 0000000..6018647
+--- /dev/null
++++ b/src/runtime/mini_hip.h
+@@ -0,0 +1,220 @@
++#ifndef HALIDE_MINI_HIP_H
++#define HALIDE_MINI_HIP_H
++
++// Minimal subset of the HIP (AMD ROCm) API types needed by hip.cpp, mirroring
++// mini_cuda.h. Nothing here is a full HIP header; only what the runtime uses.
++//
++// All values were transcribed from the ROCm headers on 2026-09-04:
++//   [A] https://raw.githubusercontent.com/ROCm/HIP/develop/include/hip/hip_runtime_api.h
++//       (hipError_t, hipDeviceAttribute_t (ROCm 6.x/7.x numbering), hipMemoryType,
++//        HIP_LAUNCH_PARAM_*, opaque handle typedefs, function prototypes)
++//   [B] https://raw.githubusercontent.com/ROCm/HIP/develop/include/hip/driver_types.h
++//       (hipDeviceptr_t, hipArray_t, HIP_MEMCPY3D, hipMemcpyKind)
++//   [C] https://raw.githubusercontent.com/ROCm/HIP/rocm-5.7.x/include/hip/hip_runtime_api.h
++//       (ROCm 5.x numbering of the AMD-specific attributes, i.e. hipDeviceAttributeGcnArch)
++//   [D] https://raw.githubusercontent.com/ROCm/clr/develop/hipamd/src/hip_device.cpp
++//       (how gcnArch / hipDeviceComputeCapability are computed by the driver)
++
++namespace Halide {
++namespace Runtime {
++namespace Internal {
++namespace Hip {
++
++// HIP uses the platform's default C calling convention everywhere (the Windows
++// build of HIP is 64-bit only, so there is no __stdcall variant as with CUDA).
++#define HIPAPI
++
++// [B] driver_types.h: `typedef void* hipDeviceptr_t;`. We keep HIP's exact
++// definition (a pointer, not an integer) so the function-pointer signatures in
++// hip_functions.h are ABI-identical to the real prototypes. halide_buffer_t
++// stores the handle in its uint64_t `device` field; hip.cpp converts with
++// (hipDeviceptr_t)(uintptr_t)buf->device and back with (uint64_t)(uintptr_t)p.
++typedef void *hipDeviceptr_t;
++
++typedef int hipDevice_t;                          /**< HIP device ordinal [A] */
++typedef struct ihipModule_t *hipModule_t;         /**< loaded code object [A] */
++typedef struct ihipModuleSymbol_t *hipFunction_t; /**< kernel handle [A] */
++typedef struct ihipStream_t *hipStream_t;         /**< stream [A] */
++typedef struct hipArray *hipArray_t;              /**< array (only appears in HIP_MEMCPY3D) [B] */
++struct hipPointerAttribute_t;                     /**< opaque; layout differs between ROCm 5 and 6 */
++struct hipDeviceProp_t;                           /**< opaque; layout differs between ROCm 5 and 6 */
++
++// [A] `typedef enum __HIP_NODISCARD hipError_t { ... } hipError_t;`. We use a
++// plain int for the typedef (ABI-identical) plus an enum of the values we need.
++typedef int hipError_t;
++
++enum hipError_enum {
++    hipSuccess = 0,
++    hipErrorInvalidValue = 1,
++    hipErrorOutOfMemory = 2,
++    hipErrorNotInitialized = 3,
++    hipErrorDeinitialized = 4,
++    hipErrorProfilerDisabled = 5,
++    hipErrorProfilerNotInitialized = 6,
++    hipErrorProfilerAlreadyStarted = 7,
++    hipErrorProfilerAlreadyStopped = 8,
++    hipErrorInvalidConfiguration = 9,
++    hipErrorInvalidPitchValue = 12,
++    hipErrorInvalidSymbol = 13,
++    hipErrorInvalidDevicePointer = 17,
++    hipErrorInvalidMemcpyDirection = 21,
++    hipErrorInsufficientDriver = 35,
++    hipErrorMissingConfiguration = 52,
++    hipErrorPriorLaunchFailure = 53,
++    hipErrorInvalidDeviceFunction = 98,
++    hipErrorNoDevice = 100,
++    hipErrorInvalidDevice = 101,
++    hipErrorInvalidImage = 200,
++    hipErrorInvalidContext = 201,
++    hipErrorContextAlreadyCurrent = 202,
++    hipErrorMapFailed = 205,
++    hipErrorUnmapFailed = 206,
++    hipErrorArrayIsMapped = 207,
++    hipErrorAlreadyMapped = 208,
++    hipErrorNoBinaryForGpu = 209,
++    hipErrorAlreadyAcquired = 210,
++    hipErrorNotMapped = 211,
++    hipErrorNotMappedAsArray = 212,
++    hipErrorNotMappedAsPointer = 213,
++    hipErrorECCNotCorrectable = 214,
++    hipErrorUnsupportedLimit = 215,
++    hipErrorContextAlreadyInUse = 216,
++    hipErrorPeerAccessUnsupported = 217,
++    hipErrorInvalidKernelFile = 218,
++    hipErrorInvalidGraphicsContext = 219,
++    hipErrorInvalidSource = 300,
++    hipErrorFileNotFound = 301,
++    hipErrorSharedObjectSymbolNotFound = 302,
++    hipErrorSharedObjectInitFailed = 303,
++    hipErrorOperatingSystem = 304,
++    hipErrorInvalidHandle = 400,
++    hipErrorIllegalState = 401,
++    hipErrorNotFound = 500,
++    hipErrorNotReady = 600,
++    hipErrorIllegalAddress = 700,
++    hipErrorLaunchOutOfResources = 701,
++    hipErrorLaunchTimeOut = 702,
++    hipErrorPeerAccessAlreadyEnabled = 704,
++    hipErrorPeerAccessNotEnabled = 705,
++    hipErrorSetOnActiveProcess = 708,
++    hipErrorContextIsDestroyed = 709,
++    hipErrorAssert = 710,
++    hipErrorHostMemoryAlreadyRegistered = 712,
++    hipErrorHostMemoryNotRegistered = 713,
++    hipErrorLaunchFailure = 719,
++    hipErrorCooperativeLaunchTooLarge = 720,
++    hipErrorNotSupported = 801,
++    hipErrorStreamCaptureUnsupported = 900,
++    hipErrorStreamCaptureInvalidated = 901,
++    hipErrorStreamCaptureMerge = 902,
++    hipErrorStreamCaptureUnmatched = 903,
++    hipErrorStreamCaptureUnjoined = 904,
++    hipErrorStreamCaptureIsolation = 905,
++    hipErrorStreamCaptureImplicit = 906,
++    hipErrorCapturedEvent = 907,
++    hipErrorStreamCaptureWrongThread = 908,
++    hipErrorGraphExecUpdateFailure = 910,
++    hipErrorUnknown = 999,
++    hipErrorRuntimeMemory = 1052,
++    hipErrorRuntimeOther = 1053,
++    hipErrorTbd = 1054
++};
++
++// [A] hipDeviceAttribute_t. The CUDA-compatible block starts at
++// hipDeviceAttributeCudaCompatibleBegin = 0 and is numbered implicitly
++// (alphabetically); the AMD-specific block starts at 10000. The values below
++// were computed by numbering the enum in [A] and cross-checked against [C]:
++// the CUDA-compatible values are IDENTICAL in ROCm 5.7 and ROCm 6.x/7.x.
++//
++// The AMD-specific block did change between 5.x and 6.x:
++//   ROCm 5.x [C]:  10001 hipDeviceAttributeArch, 10003 hipDeviceAttributeGcnArch,
++//                  10004 hipDeviceAttributeGcnArchName
++//   ROCm 6.x+ [A]: 10001 hipDeviceAttributeUnused3 ("Previously hipDeviceAttributeArch"),
++//                  10003 hipDeviceAttributeUnused4 ("Previously hipDeviceAttributeGcnArch"),
++//                  10004 hipDeviceAttributeUnused5 ("Previously hipDeviceAttributeGcnArchName")
++// so querying hipDeviceAttributeGcnArch on a ROCm 6+ runtime returns
++// hipErrorInvalidValue. hip.cpp therefore only uses it as a fallback.
++typedef enum {
++    hipDeviceAttributeCudaCompatibleBegin = 0,
++    hipDeviceAttributeComputeCapabilityMajor = 23,  /**< Major compute capability (= gfx ISA major, e.g. 9 for gfx942) */
++    hipDeviceAttributeMaxBlockDimX = 26,            /**< Max block size in width */
++    hipDeviceAttributeMaxBlockDimY = 27,            /**< Max block size in height */
++    hipDeviceAttributeMaxBlockDimZ = 28,            /**< Max block size in depth */
++    hipDeviceAttributeMaxGridDimX = 29,             /**< Max grid size in width */
++    hipDeviceAttributeMaxGridDimY = 30,             /**< Max grid size in height */
++    hipDeviceAttributeMaxGridDimZ = 31,             /**< Max grid size in depth */
++    hipDeviceAttributeMaxThreadsPerBlock = 56,      /**< Maximum number of threads per block */
++    hipDeviceAttributeComputeCapabilityMinor = 61,  /**< Minor compute capability (= gfx ISA minor, e.g. 4 for gfx942) */
++    hipDeviceAttributeMultiprocessorCount = 63,     /**< Number of compute units */
++    hipDeviceAttributeMaxSharedMemoryPerBlock = 74, /**< Maximum LDS bytes per workgroup */
++    hipDeviceAttributeTotalConstantMemory = 83,     /**< Constant memory size in bytes */
++    hipDeviceAttributeTotalGlobalMem = 84,          /**< Global memory available on device */
++    hipDeviceAttributeWarpSize = 87,                /**< Wavefront size (64 on gfx9, 32 on gfx10+) */
++    hipDeviceAttributeCudaCompatibleEnd = 9999,
++    hipDeviceAttributeAmdSpecificBegin = 10000,
++    hipDeviceAttributeGcnArch = 10003,     /**< ROCm 5.x ONLY: isa.major*100 + isa.minor*10 + isa.stepping ([D]); unused/invalid on ROCm 6+ */
++    hipDeviceAttributeGcnArchName = 10004, /**< ROCm 5.x ONLY; not usable through an int* anyway */
++    hipDeviceAttributeAmdSpecificEnd = 19999,
++    hipDeviceAttributeVendorSpecificBegin = 20000,
++} hipDeviceAttribute_t;
++
++// [A] hipMemoryType (used by HIP_MEMCPY3D).
++typedef enum hipMemoryType {
++    hipMemoryTypeUnregistered = 0,
++    hipMemoryTypeHost = 1,
++    hipMemoryTypeDevice = 2,
++    hipMemoryTypeManaged = 3,
++    hipMemoryTypeArray = 10,
++    hipMemoryTypeUnified = 11
++} hipMemoryType;
++
++// [B] hipMemcpyKind (not needed by the driver-style copy entry points we use,
++// kept for completeness / future hipMemcpy* use).
++typedef enum hipMemcpyKind {
++    hipMemcpyHostToHost = 0,
++    hipMemcpyHostToDevice = 1,
++    hipMemcpyDeviceToHost = 2,
++    hipMemcpyDeviceToDevice = 3,
++    hipMemcpyDefault = 4,
++    hipMemcpyDeviceToDeviceNoCU = 1024
++} hipMemcpyKind;
++
++// [B] HIP_MEMCPY3D, field order copied exactly. Note that unlike CUDA_MEMCPY3D
++// there are no reserved0/reserved1 members.
++typedef struct HIP_MEMCPY3D {
++    size_t srcXInBytes;          /**< Source X in bytes */
++    size_t srcY;                 /**< Source Y */
++    size_t srcZ;                 /**< Source Z */
++    size_t srcLOD;               /**< Source LOD */
++    hipMemoryType srcMemoryType; /**< Source memory type */
++    const void *srcHost;         /**< Source host pointer */
++    hipDeviceptr_t srcDevice;    /**< Source device */
++    hipArray_t srcArray;         /**< Source array */
++    size_t srcPitch;             /**< Source pitch */
++    size_t srcHeight;            /**< Source height */
++    size_t dstXInBytes;          /**< Destination X in bytes */
++    size_t dstY;                 /**< Destination Y */
++    size_t dstZ;                 /**< Destination Z */
++    size_t dstLOD;               /**< Destination LOD */
++    hipMemoryType dstMemoryType; /**< Destination memory type */
++    void *dstHost;               /**< Destination host pointer */
++    hipDeviceptr_t dstDevice;    /**< Destination device */
++    hipArray_t dstArray;         /**< Destination array */
++    size_t dstPitch;             /**< Destination pitch */
++    size_t dstHeight;            /**< Destination height */
++    size_t WidthInBytes;         /**< Width in bytes of 3D memory copy */
++    size_t Height;               /**< Height (rows) of 3D memory copy */
++    size_t Depth;                /**< Depth (slices) of 3D memory copy */
++} HIP_MEMCPY3D;
++
++// [A] Markers for the `extra` argument of hipModuleLaunchKernel.
++#define HIP_LAUNCH_PARAM_BUFFER_POINTER ((void *)0x01)
++#define HIP_LAUNCH_PARAM_BUFFER_SIZE ((void *)0x02)
++#define HIP_LAUNCH_PARAM_END ((void *)0x03)
++
++}  // namespace Hip
++}  // namespace Internal
++}  // namespace Runtime
++}  // namespace Halide
++
++#endif  // HALIDE_MINI_HIP_H
+diff --git a/src/runtime/windows_hip.cpp b/src/runtime/windows_hip.cpp
+new file mode 100644
+index 0000000..213381d
+--- /dev/null
++++ b/src/runtime/windows_hip.cpp
+@@ -0,0 +1,2 @@
++#define WINDOWS
++#include "hip.cpp"
+-- 
+2.43.0
+

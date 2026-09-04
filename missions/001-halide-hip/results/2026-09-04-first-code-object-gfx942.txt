@@ -1,0 +1,452 @@
+# First AMDGPU code object produced by Halide (hip-backend, pre-T3/T4 stub codegen), 2026-09-04
+# Pipeline: f(x,y) = in(x,y)*p + 1.0f; f.gpu_tile(x,y,xo,yo,xi,yi,16,16); compile_to_object(host-hip-hip_gfx942)
+# Blob carved from smoke.o .rodata (symbol hip_gpu_source_kernels). Stage: ET_REL (lld link is task T4).
+
+## llvm-readelf --file-header
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 40 03 00 00 00 00 00 00 00
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            AMDGPU - HSA
+  ABI Version:                       3
+  Type:                              REL (Relocatable file)
+  Machine:                           EM_AMDGPU
+  Version:                           0x1
+  Entry point address:               0x0
+  Start of program headers:          0 (bytes into file)
+  Start of section headers:          3624 (bytes into file)
+  Flags:                             0x54c, gfx942, xnack, sramecc
+  Size of this header:               64 (bytes)
+  Size of program headers:           0 (bytes)
+  Number of program headers:         0
+  Size of section headers:           64 (bytes)
+  Number of section headers:         9
+  Section header string table index: 1
+
+## llvm-readelf --notes
+Displaying notes found in: .note
+  Owner                Data size 	Description
+  AMDGPU               0x00000486	NT_AMDGPU_METADATA (AMDGPU Metadata)
+    AMDGPU Metadata:
+        ---
+amdhsa.kernels:
+  - .agpr_count:     0
+    .args:
+      - .actual_access:  write_only
+        .address_space:  generic
+        .name:           f
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  generic
+        .name:           in
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .name:           f.extent.0
+        .offset:         16
+        .size:           4
+        .value_kind:     by_value
+      - .name:           f.extent.1
+        .offset:         20
+        .size:           4
+        .value_kind:     by_value
+      - .name:           f.min.0
+        .offset:         24
+        .size:           4
+        .value_kind:     by_value
+      - .name:           f.min.1
+        .offset:         28
+        .size:           4
+        .value_kind:     by_value
+      - .name:           f.stride.1
+        .offset:         32
+        .size:           4
+        .value_kind:     by_value
+      - .name:           in.min.0
+        .offset:         36
+        .size:           4
+        .value_kind:     by_value
+      - .name:           in.min.1
+        .offset:         40
+        .size:           4
+        .value_kind:     by_value
+      - .name:           in.stride.1
+        .offset:         44
+        .size:           4
+        .value_kind:     by_value
+      - .name:           p
+        .offset:         48
+        .size:           4
+        .value_kind:     by_value
+      - .name:           t243
+        .offset:         52
+        .size:           4
+        .value_kind:     by_value
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 56
+    .max_flat_workgroup_size: 256
+    .name:           _kernel_f_s0_y_v1_block_id_y
+    .private_segment_fixed_size: 0
+    .sgpr_count:     24
+    .sgpr_spill_count: 0
+    .symbol:         _kernel_f_s0_y_v1_block_id_y.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     8
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+amdhsa.target:   amdgcn-amd-amdhsa--gfx942
+amdhsa.version:
+  - 1
+  - 2
+...
+
+
+## llvm-readelf -s
+
+Symbol table '.symtab' contains 11 entries:
+   Num:    Value          Size Type    Bind   Vis       Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   UND 
+     1: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.private_seg_size
+     2: 0000000000000008     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.num_vgpr
+     3: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.num_agpr
+     4: 0000000000000012     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.numbered_sgpr
+     5: 0000000000000001     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.uses_vcc
+     6: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.uses_flat_scratch
+     7: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.has_dyn_sized_stack
+     8: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT   ABS _kernel_f_s0_y_v1_block_id_y.has_recursion
+     9: 0000000000000000   272 FUNC    GLOBAL PROTECTED   2 _kernel_f_s0_y_v1_block_id_y
+    10: 0000000000000000    64 OBJECT  GLOBAL DEFAULT     3 _kernel_f_s0_y_v1_block_id_y.kd
+
+## llvm-readelf -r
+
+Relocation section '.rela.rodata' at offset 0xc28 contains 1 entries:
+    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend
+0000000000000010  0000000900000005 R_AMDGPU_REL64         0000000000000000 _kernel_f_s0_y_v1_block_id_y + 10
+
+## llvm-objdump -d --mcpu=gfx942
+
+kernel_blob.bin:	file format elf64-amdgpu
+
+Disassembly of section .text:
+
+0000000000000000 <_kernel_f_s0_y_v1_block_id_y>:
+	s_load_dwordx8 s[4:11], s[0:1], 0x10                       // 000000000000: C00E0100 00000010
+	s_load_dwordx4 s[12:15], s[0:1], 0x0                       // 000000000008: C00A0300 00000000
+	s_load_dwordx2 s[16:17], s[0:1], 0x30                      // 000000000010: C0060400 00000030
+	s_lshl_b32 s0, s3, 4                                       // 000000000018: 8E008403
+	v_and_b32_e32 v1, 0x3ff, v0                                // 00000000001C: 260200FF 000003FF
+	s_waitcnt lgkmcnt(0)                                       // 000000000024: BF8CC07F
+	s_add_i32 s1, s5, -16                                      // 000000000028: 8101D005
+	s_min_i32 s0, s0, s1                                       // 00000000002C: 83000100
+	v_bfe_u32 v0, v0, 10, 10                                   // 000000000030: D1C80000 02291500
+	s_ashr_i32 s1, s4, 4                                       // 000000000038: 90018404
+	v_add_u32_e32 v0, s0, v0                                   // 00000000003C: 68000000
+	s_cmp_ge_i32 s2, s1                                        // 000000000040: BF030102
+	v_add_u32_e32 v2, s7, v0                                   // 000000000044: 68040007
+	s_mov_b64 s[0:1], -1                                       // 000000000048: BE8001C1
+	s_cbranch_scc1 3                                           // 00000000004C: BF850003 <_kernel_f_s0_y_v1_block_id_y+0x5c>
+	s_andn2_b64 vcc, exec, s[0:1]                              // 000000000050: 89EA007E
+	s_cbranch_vccz 23                                          // 000000000054: BF860017 <_kernel_f_s0_y_v1_block_id_y+0xb4>
+	s_endpgm                                                   // 000000000058: BF810000
+	v_add_u32_e32 v4, s4, v1                                   // 00000000005C: 68080204
+	v_add_u32_e32 v5, s6, v4                                   // 000000000060: 680A0806
+	v_subrev_u32_e32 v3, s10, v2                               // 000000000064: 6C06040A
+	v_subrev_u32_e32 v6, s9, v5                                // 000000000068: 6C0C0A09
+	v_mad_u64_u32 v[6:7], s[0:1], v3, s11, v[6:7]              // 00000000006C: D1E80006 04181703
+	v_ashrrev_i32_e32 v7, 31, v6                               // 000000000074: 220E0C9F
+	v_lshl_add_u64 v[6:7], v[6:7], 2, s[14:15]                 // 000000000078: D2080006 00390506
+	global_load_dword v3, v[6:7], off offset:-64               // 000000000080: DC509FC0 037F0006
+	v_mad_u64_u32 v[4:5], s[0:1], v0, s8, v[4:5]               // 000000000088: D1E80004 04101100
+	v_ashrrev_i32_e32 v5, 31, v4                               // 000000000090: 220A089F
+	v_lshl_add_u64 v[4:5], v[4:5], 2, s[12:13]                 // 000000000094: D2080004 00310504
+	s_waitcnt vmcnt(0)                                         // 00000000009C: BF8C0F70
+	v_fma_f32 v3, v3, s16, 1.0                                 // 0000000000A0: D1CB0003 03C82103
+	global_store_dword v[4:5], v3, off offset:-64              // 0000000000A8: DC709FC0 007F0304
+	s_cbranch_execnz 65513                                     // 0000000000B0: BF89FFE9 <_kernel_f_s0_y_v1_block_id_y+0x58>
+	v_mul_lo_u32 v3, s11, v2                                   // 0000000000B4: D2850003 0002040B
+	v_lshl_add_u32 v2, s2, 4, v1                               // 0000000000BC: D1FD0002 04050802
+	v_subrev_u32_e32 v1, s9, v2                                // 0000000000C4: 6C020409
+	v_add3_u32 v4, v1, v3, s17                                 // 0000000000C8: D1FF0004 00460701
+	v_ashrrev_i32_e32 v5, 31, v4                               // 0000000000D0: 220A089F
+	v_lshl_add_u64 v[4:5], v[4:5], 2, s[14:15]                 // 0000000000D4: D2080004 00390504
+	global_load_dword v3, v[4:5], off                          // 0000000000DC: DC508000 037F0004
+	s_waitcnt vmcnt(0)                                         // 0000000000E4: BF8C0F70
+	v_mad_u64_u32 v[0:1], s[0:1], v0, s8, v[2:3]               // 0000000000E8: D1E80000 04081100
+	v_ashrrev_i32_e32 v1, 31, v0                               // 0000000000F0: 2202009F
+	v_fma_f32 v2, v3, s16, 1.0                                 // 0000000000F4: D1CB0002 03C82103
+	v_lshl_add_u64 v[0:1], v[0:1], 2, s[12:13]                 // 0000000000FC: D2080000 00310500
+	global_store_dword v[0:1], v2, off                         // 000000000104: DC708000 007F0200
+	s_endpgm                                                   // 00000000010C: BF810000
+	s_nop 0                                                    // 000000000110: BF800000
+	s_nop 0                                                    // 000000000114: BF800000
+	s_nop 0                                                    // 000000000118: BF800000
+	s_nop 0                                                    // 00000000011C: BF800000
+	s_nop 0                                                    // 000000000120: BF800000
+	s_nop 0                                                    // 000000000124: BF800000
+	s_nop 0                                                    // 000000000128: BF800000
+	s_nop 0                                                    // 00000000012C: BF800000
+	s_nop 0                                                    // 000000000130: BF800000
+	s_nop 0                                                    // 000000000134: BF800000
+	s_nop 0                                                    // 000000000138: BF800000
+	s_nop 0                                                    // 00000000013C: BF800000
+	s_nop 0                                                    // 000000000140: BF800000
+	s_nop 0                                                    // 000000000144: BF800000
+	s_nop 0                                                    // 000000000148: BF800000
+	s_nop 0                                                    // 00000000014C: BF800000
+	s_nop 0                                                    // 000000000150: BF800000
+	s_nop 0                                                    // 000000000154: BF800000
+	s_nop 0                                                    // 000000000158: BF800000
+	s_nop 0                                                    // 00000000015C: BF800000
+	s_nop 0                                                    // 000000000160: BF800000
+	s_nop 0                                                    // 000000000164: BF800000
+	s_nop 0                                                    // 000000000168: BF800000
+	s_nop 0                                                    // 00000000016C: BF800000
+	s_nop 0                                                    // 000000000170: BF800000
+	s_nop 0                                                    // 000000000174: BF800000
+	s_nop 0                                                    // 000000000178: BF800000
+	s_nop 0                                                    // 00000000017C: BF800000
+	s_nop 0                                                    // 000000000180: BF800000
+	s_nop 0                                                    // 000000000184: BF800000
+	s_nop 0                                                    // 000000000188: BF800000
+	s_nop 0                                                    // 00000000018C: BF800000
+	s_nop 0                                                    // 000000000190: BF800000
+	s_nop 0                                                    // 000000000194: BF800000
+	s_nop 0                                                    // 000000000198: BF800000
+	s_nop 0                                                    // 00000000019C: BF800000
+	s_nop 0                                                    // 0000000001A0: BF800000
+	s_nop 0                                                    // 0000000001A4: BF800000
+	s_nop 0                                                    // 0000000001A8: BF800000
+	s_nop 0                                                    // 0000000001AC: BF800000
+	s_nop 0                                                    // 0000000001B0: BF800000
+	s_nop 0                                                    // 0000000001B4: BF800000
+	s_nop 0                                                    // 0000000001B8: BF800000
+	s_nop 0                                                    // 0000000001BC: BF800000
+	s_nop 0                                                    // 0000000001C0: BF800000
+	s_nop 0                                                    // 0000000001C4: BF800000
+	s_nop 0                                                    // 0000000001C8: BF800000
+	s_nop 0                                                    // 0000000001CC: BF800000
+	s_nop 0                                                    // 0000000001D0: BF800000
+	s_nop 0                                                    // 0000000001D4: BF800000
+	s_nop 0                                                    // 0000000001D8: BF800000
+	s_nop 0                                                    // 0000000001DC: BF800000
+	s_nop 0                                                    // 0000000001E0: BF800000
+	s_nop 0                                                    // 0000000001E4: BF800000
+	s_nop 0                                                    // 0000000001E8: BF800000
+	s_nop 0                                                    // 0000000001EC: BF800000
+	s_nop 0                                                    // 0000000001F0: BF800000
+	s_nop 0                                                    // 0000000001F4: BF800000
+	s_nop 0                                                    // 0000000001F8: BF800000
+	s_nop 0                                                    // 0000000001FC: BF800000
+	s_nop 0                                                    // 000000000200: BF800000
+	s_nop 0                                                    // 000000000204: BF800000
+	s_nop 0                                                    // 000000000208: BF800000
+	s_nop 0                                                    // 00000000020C: BF800000
+	s_nop 0                                                    // 000000000210: BF800000
+	s_nop 0                                                    // 000000000214: BF800000
+	s_nop 0                                                    // 000000000218: BF800000
+	s_nop 0                                                    // 00000000021C: BF800000
+	s_nop 0                                                    // 000000000220: BF800000
+	s_nop 0                                                    // 000000000224: BF800000
+	s_nop 0                                                    // 000000000228: BF800000
+	s_nop 0                                                    // 00000000022C: BF800000
+	s_nop 0                                                    // 000000000230: BF800000
+	s_nop 0                                                    // 000000000234: BF800000
+	s_nop 0                                                    // 000000000238: BF800000
+	s_nop 0                                                    // 00000000023C: BF800000
+	s_nop 0                                                    // 000000000240: BF800000
+	s_nop 0                                                    // 000000000244: BF800000
+	s_nop 0                                                    // 000000000248: BF800000
+	s_nop 0                                                    // 00000000024C: BF800000
+	s_nop 0                                                    // 000000000250: BF800000
+	s_nop 0                                                    // 000000000254: BF800000
+	s_nop 0                                                    // 000000000258: BF800000
+	s_nop 0                                                    // 00000000025C: BF800000
+	s_nop 0                                                    // 000000000260: BF800000
+	s_nop 0                                                    // 000000000264: BF800000
+	s_nop 0                                                    // 000000000268: BF800000
+	s_nop 0                                                    // 00000000026C: BF800000
+	s_nop 0                                                    // 000000000270: BF800000
+	s_nop 0                                                    // 000000000274: BF800000
+	s_nop 0                                                    // 000000000278: BF800000
+	s_nop 0                                                    // 00000000027C: BF800000
+	s_nop 0                                                    // 000000000280: BF800000
+	s_nop 0                                                    // 000000000284: BF800000
+	s_nop 0                                                    // 000000000288: BF800000
+	s_nop 0                                                    // 00000000028C: BF800000
+	s_nop 0                                                    // 000000000290: BF800000
+	s_nop 0                                                    // 000000000294: BF800000
+	s_nop 0                                                    // 000000000298: BF800000
+	s_nop 0                                                    // 00000000029C: BF800000
+	s_nop 0                                                    // 0000000002A0: BF800000
+	s_nop 0                                                    // 0000000002A4: BF800000
+	s_nop 0                                                    // 0000000002A8: BF800000
+	s_nop 0                                                    // 0000000002AC: BF800000
+	s_nop 0                                                    // 0000000002B0: BF800000
+	s_nop 0                                                    // 0000000002B4: BF800000
+	s_nop 0                                                    // 0000000002B8: BF800000
+	s_nop 0                                                    // 0000000002BC: BF800000
+	s_nop 0                                                    // 0000000002C0: BF800000
+	s_nop 0                                                    // 0000000002C4: BF800000
+	s_nop 0                                                    // 0000000002C8: BF800000
+	s_nop 0                                                    // 0000000002CC: BF800000
+	s_nop 0                                                    // 0000000002D0: BF800000
+	s_nop 0                                                    // 0000000002D4: BF800000
+	s_nop 0                                                    // 0000000002D8: BF800000
+	s_nop 0                                                    // 0000000002DC: BF800000
+	s_nop 0                                                    // 0000000002E0: BF800000
+	s_nop 0                                                    // 0000000002E4: BF800000
+	s_nop 0                                                    // 0000000002E8: BF800000
+	s_nop 0                                                    // 0000000002EC: BF800000
+	s_nop 0                                                    // 0000000002F0: BF800000
+	s_nop 0                                                    // 0000000002F4: BF800000
+	s_nop 0                                                    // 0000000002F8: BF800000
+	s_nop 0                                                    // 0000000002FC: BF800000
+	s_nop 0                                                    // 000000000300: BF800000
+	s_nop 0                                                    // 000000000304: BF800000
+	s_nop 0                                                    // 000000000308: BF800000
+	s_nop 0                                                    // 00000000030C: BF800000
+	s_nop 0                                                    // 000000000310: BF800000
+	s_nop 0                                                    // 000000000314: BF800000
+	s_nop 0                                                    // 000000000318: BF800000
+	s_nop 0                                                    // 00000000031C: BF800000
+	s_nop 0                                                    // 000000000320: BF800000
+	s_nop 0                                                    // 000000000324: BF800000
+	s_nop 0                                                    // 000000000328: BF800000
+	s_nop 0                                                    // 00000000032C: BF800000
+	s_nop 0                                                    // 000000000330: BF800000
+	s_nop 0                                                    // 000000000334: BF800000
+	s_nop 0                                                    // 000000000338: BF800000
+	s_nop 0                                                    // 00000000033C: BF800000
+	s_nop 0                                                    // 000000000340: BF800000
+	s_nop 0                                                    // 000000000344: BF800000
+	s_nop 0                                                    // 000000000348: BF800000
+	s_nop 0                                                    // 00000000034C: BF800000
+	s_nop 0                                                    // 000000000350: BF800000
+	s_nop 0                                                    // 000000000354: BF800000
+	s_nop 0                                                    // 000000000358: BF800000
+	s_nop 0                                                    // 00000000035C: BF800000
+	s_nop 0                                                    // 000000000360: BF800000
+	s_nop 0                                                    // 000000000364: BF800000
+	s_nop 0                                                    // 000000000368: BF800000
+	s_nop 0                                                    // 00000000036C: BF800000
+	s_nop 0                                                    // 000000000370: BF800000
+	s_nop 0                                                    // 000000000374: BF800000
+	s_nop 0                                                    // 000000000378: BF800000
+	s_nop 0                                                    // 00000000037C: BF800000
+	s_nop 0                                                    // 000000000380: BF800000
+	s_nop 0                                                    // 000000000384: BF800000
+	s_nop 0                                                    // 000000000388: BF800000
+	s_nop 0                                                    // 00000000038C: BF800000
+	s_nop 0                                                    // 000000000390: BF800000
+	s_nop 0                                                    // 000000000394: BF800000
+	s_nop 0                                                    // 000000000398: BF800000
+	s_nop 0                                                    // 00000000039C: BF800000
+	s_nop 0                                                    // 0000000003A0: BF800000
+	s_nop 0                                                    // 0000000003A4: BF800000
+	s_nop 0                                                    // 0000000003A8: BF800000
+	s_nop 0                                                    // 0000000003AC: BF800000
+	s_nop 0                                                    // 0000000003B0: BF800000
+	s_nop 0                                                    // 0000000003B4: BF800000
+	s_nop 0                                                    // 0000000003B8: BF800000
+	s_nop 0                                                    // 0000000003BC: BF800000
+	s_nop 0                                                    // 0000000003C0: BF800000
+	s_nop 0                                                    // 0000000003C4: BF800000
+	s_nop 0                                                    // 0000000003C8: BF800000
+	s_nop 0                                                    // 0000000003CC: BF800000
+	s_nop 0                                                    // 0000000003D0: BF800000
+	s_nop 0                                                    // 0000000003D4: BF800000
+	s_nop 0                                                    // 0000000003D8: BF800000
+	s_nop 0                                                    // 0000000003DC: BF800000
+	s_nop 0                                                    // 0000000003E0: BF800000
+	s_nop 0                                                    // 0000000003E4: BF800000
+	s_nop 0                                                    // 0000000003E8: BF800000
+	s_nop 0                                                    // 0000000003EC: BF800000
+	s_nop 0                                                    // 0000000003F0: BF800000
+	s_nop 0                                                    // 0000000003F4: BF800000
+	s_nop 0                                                    // 0000000003F8: BF800000
+	s_nop 0                                                    // 0000000003FC: BF800000
+	s_nop 0                                                    // 000000000400: BF800000
+	s_nop 0                                                    // 000000000404: BF800000
+	s_nop 0                                                    // 000000000408: BF800000
+	s_nop 0                                                    // 00000000040C: BF800000
+	s_nop 0                                                    // 000000000410: BF800000
+	s_nop 0                                                    // 000000000414: BF800000
+	s_nop 0                                                    // 000000000418: BF800000
+	s_nop 0                                                    // 00000000041C: BF800000
+	s_nop 0                                                    // 000000000420: BF800000
+	s_nop 0                                                    // 000000000424: BF800000
+	s_nop 0                                                    // 000000000428: BF800000
+	s_nop 0                                                    // 00000000042C: BF800000
+	s_nop 0                                                    // 000000000430: BF800000
+	s_nop 0                                                    // 000000000434: BF800000
+	s_nop 0                                                    // 000000000438: BF800000
+	s_nop 0                                                    // 00000000043C: BF800000
+	s_nop 0                                                    // 000000000440: BF800000
+	s_nop 0                                                    // 000000000444: BF800000
+	s_nop 0                                                    // 000000000448: BF800000
+	s_nop 0                                                    // 00000000044C: BF800000
+	s_nop 0                                                    // 000000000450: BF800000
+	s_nop 0                                                    // 000000000454: BF800000
+	s_nop 0                                                    // 000000000458: BF800000
+	s_nop 0                                                    // 00000000045C: BF800000
+	s_nop 0                                                    // 000000000460: BF800000
+	s_nop 0                                                    // 000000000464: BF800000
+	s_nop 0                                                    // 000000000468: BF800000
+	s_nop 0                                                    // 00000000046C: BF800000
+	s_nop 0                                                    // 000000000470: BF800000
+	s_nop 0                                                    // 000000000474: BF800000
+	s_nop 0                                                    // 000000000478: BF800000
+	s_nop 0                                                    // 00000000047C: BF800000
+	s_nop 0                                                    // 000000000480: BF800000
+	s_nop 0                                                    // 000000000484: BF800000
+	s_nop 0                                                    // 000000000488: BF800000
+	s_nop 0                                                    // 00000000048C: BF800000
+	s_nop 0                                                    // 000000000490: BF800000
+	s_nop 0                                                    // 000000000494: BF800000
+	s_nop 0                                                    // 000000000498: BF800000
+	s_nop 0                                                    // 00000000049C: BF800000
+	s_nop 0                                                    // 0000000004A0: BF800000
+	s_nop 0                                                    // 0000000004A4: BF800000
+	s_nop 0                                                    // 0000000004A8: BF800000
+	s_nop 0                                                    // 0000000004AC: BF800000
+	s_nop 0                                                    // 0000000004B0: BF800000
+	s_nop 0                                                    // 0000000004B4: BF800000
+	s_nop 0                                                    // 0000000004B8: BF800000
+	s_nop 0                                                    // 0000000004BC: BF800000
+	s_nop 0                                                    // 0000000004C0: BF800000
+	s_nop 0                                                    // 0000000004C4: BF800000
+	s_nop 0                                                    // 0000000004C8: BF800000
+	s_nop 0                                                    // 0000000004CC: BF800000
+	s_nop 0                                                    // 0000000004D0: BF800000
+	s_nop 0                                                    // 0000000004D4: BF800000
+	s_nop 0                                                    // 0000000004D8: BF800000
+	s_nop 0                                                    // 0000000004DC: BF800000
+	s_nop 0                                                    // 0000000004E0: BF800000
+	s_nop 0                                                    // 0000000004E4: BF800000
+	s_nop 0                                                    // 0000000004E8: BF800000
+	s_nop 0                                                    // 0000000004EC: BF800000
+	s_nop 0                                                    // 0000000004F0: BF800000
+	s_nop 0                                                    // 0000000004F4: BF800000
+	s_nop 0                                                    // 0000000004F8: BF800000
+	s_nop 0                                                    // 0000000004FC: BF800000
+	s_nop 0                                                    // 000000000500: BF800000
+	s_nop 0                                                    // 000000000504: BF800000
+	s_nop 0                                                    // 000000000508: BF800000
+	s_nop 0                                                    // 00000000050C: BF800000
+	s_nop 0                                                    // 000000000510: BF800000
+	s_nop 0                                                    // 000000000514: BF800000
+	s_nop 0                                                    // 000000000518: BF800000
+	s_nop 0                                                    // 00000000051C: BF800000
+	s_nop 0                                                    // 000000000520: BF800000
+	s_nop 0                                                    // 000000000524: BF800000
+	s_nop 0                                                    // 000000000528: BF800000
+	s_nop 0                                                    // 00000000052C: BF800000
+	s_nop 0                                                    // 000000000530: BF800000
+	s_nop 0                                                    // 000000000534: BF800000
+	s_nop 0                                                    // 000000000538: BF800000
+	s_nop 0                                                    // 00000000053C: BF800000

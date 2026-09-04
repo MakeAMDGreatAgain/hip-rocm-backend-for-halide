@@ -1,0 +1,5 @@
+missions/*/Halide/
+missions/*/results/*.bin
+*.hsaco
+*.o
+build/

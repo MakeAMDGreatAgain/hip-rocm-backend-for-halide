@@ -1,0 +1,1096 @@
+From 91b9daaa8cdba18375f0afe14c725ff63a3e19cf Mon Sep 17 00:00:00 2001
+From: Oussama Benjelloun <benje.oussama@gmail.com>
+Date: Fri, 4 Sep 2026 15:16:54 +0200
+Subject: [PATCH 7/7] HIP: address independent review findings
+
+- An explicit hip_gfx* feature now wins over HL_HIP_ARCH (the env var is
+  consulted only when no arch feature is set), so Module/JIT/generator
+  caches keyed on the target string stay correct.
+- gpu_object_lifetime_tracker knows hipMalloc/hipFree.
+- Document that in-kernel assertions trap (s_trap) and that ROCm reports
+  this through the queue error callback rather than a recoverable error.
+- halide_hip_device_release restores the caller's current device.
+- Host arch autodetect is silent when no HIP library/device is present.
+- f64 atomic add is supported on every arch (CAS-expanded where needed).
+- correctness_hip_code_object decodes the AMDGPU metadata msgpack and
+  asserts the exact kernarg layout, and rejects any relocation entry.
+- IRPrinter/StmtToHTML no longer print the binary code object as text;
+  CodeGen_C emits HalideRuntimeHIP.h; DeviceAPI::HIP appended at the end
+  of the enum; link failures are user errors with lld's diagnostics;
+  Makefile/xcframework/docs consistency fixes.
+
+Co-authored-by: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ Makefile                                      |   7 +-
+ cmake/HalideGeneratorHelpers.cmake            |   1 +
+ doc/CMakeLists.txt                            |   1 +
+ doc/HIP.md                                    |  69 +++-
+ doc/guides.md                                 |   1 +
+ .../halide/src/halide_/PyEnums.cpp            |   4 +-
+ src/CodeGen_AMDGPU_Dev.cpp                    |  63 +--
+ src/CodeGen_C.cpp                             |   4 +
+ src/DeviceAPI.h                               |   6 +-
+ src/IRPrinter.cpp                             |   5 +-
+ src/StmtToHTML.cpp                            |   8 +-
+ src/Target.cpp                                |  27 +-
+ src/Target.h                                  |  11 +-
+ src/runtime/HalideRuntimeHIP.h                |   9 +-
+ src/runtime/hip.cpp                           |  34 +-
+ test/common/gpu_object_lifetime_tracker.h     |   6 +-
+ test/correctness/hip_code_object.cpp          | 375 ++++++++++++++++--
+ 17 files changed, 527 insertions(+), 104 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 90e35e7..3897d9e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -126,9 +126,10 @@ WITH_RISCV ?= $(findstring riscv, $(LLVM_COMPONENTS))
+ WITH_AARCH64 ?= $(findstring aarch64, $(LLVM_COMPONENTS))
+ WITH_POWERPC ?= $(findstring powerpc, $(LLVM_COMPONENTS))
+ WITH_NVPTX ?= $(findstring nvptx, $(LLVM_COMPONENTS))
+-# The AMDGPU (HIP) backend also needs liblld (lldELF) to link code objects,
+-# so only enable it by default when both the LLVM component and lld are present.
+-WITH_AMDGPU ?= $(if $(wildcard $(LLVM_LIBDIR)/liblldELF.*),$(findstring amdgpu, $(LLVM_COMPONENTS)),)
++# The AMDGPU (HIP) backend also needs liblld (lldELF + lldCommon) to link code
++# objects, so only enable it by default when both the LLVM component and the
++# lld libraries are present.
++WITH_AMDGPU ?= $(if $(and $(wildcard $(LLVM_LIBDIR)/liblldELF.*),$(wildcard $(LLVM_LIBDIR)/liblldCommon.*)),$(findstring amdgpu, $(LLVM_COMPONENTS)),)
+ WITH_WEBASSEMBLY ?= $(findstring webassembly, $(LLVM_COMPONENTS))
+ WITH_OPENCL ?= not-empty
+ WITH_METAL ?= not-empty
+diff --git a/cmake/HalideGeneratorHelpers.cmake b/cmake/HalideGeneratorHelpers.cmake
+index 6f8920d..bbfa9f8 100644
+--- a/cmake/HalideGeneratorHelpers.cmake
++++ b/cmake/HalideGeneratorHelpers.cmake
+@@ -1477,6 +1477,7 @@ function(add_halide_xcframework TARGET)
+             HalideRuntime.h
+             HalideRuntimeCuda.h
+             HalideRuntimeD3D12Compute.h
++            HalideRuntimeHIP.h
+             HalideRuntimeHexagonDma.h
+             HalideRuntimeHexagonHost.h
+             HalideRuntimeMetal.h
+diff --git a/doc/CMakeLists.txt b/doc/CMakeLists.txt
+index 13ba994..6ff46d7 100644
+--- a/doc/CMakeLists.txt
++++ b/doc/CMakeLists.txt
+@@ -128,6 +128,7 @@ set(_sphinx_static_files
+     "${CMAKE_CURRENT_SOURCE_DIR}/GeneratorCache.md"
+     "${CMAKE_CURRENT_SOURCE_DIR}/HalideCMakePackage.md"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Hexagon.md"
++    "${CMAKE_CURRENT_SOURCE_DIR}/HIP.md"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Python.md"
+     "${CMAKE_CURRENT_SOURCE_DIR}/RunGen.md"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Testing.md"
+diff --git a/doc/HIP.md b/doc/HIP.md
+index cdbe1fd..e12a81f 100644
+--- a/doc/HIP.md
++++ b/doc/HIP.md
+@@ -62,7 +62,9 @@ Notes:
+   It does not ship the `WebAssembly` target that Halide requires, and its
+   version does not track upstream LLVM releases. Use an upstream LLVM.
+ - The Makefile build mirrors the NVPTX handling: `WITH_AMDGPU` is set when
+-  `llvm-config --targets-built` lists `AMDGPU`.
++  `llvm-config --targets-built` lists `AMDGPU` **and** `liblldELF` /
++  `liblldCommon` are present in `llvm-config --libdir` (they are linked into
++  `libHalide`).
+ 
+ ## HIP Runtime Environment
+ 
+@@ -121,9 +123,12 @@ The `hip_gfx*` feature selects the LLVM `-mcpu` value. Only one may be set on a
+ target (a HIP code object is compiled for a single architecture).
+ 
+ Architectures that have no feature can be selected with the environment
+-variable `HL_HIP_ARCH=<gfxNNNN[:xnack-][:sramecc+]>`, which takes precedence
+-over any `hip_gfx*` feature (this is the escape hatch for the long tail of AMD
+-parts: `gfx908`, `gfx1032`, `gfx1150`, `gfx1250`, ...).
++variable `HL_HIP_ARCH=<gfxNNNN[:xnack-][:sramecc+]>` on a target that has
++`hip` but **no** `hip_gfx*` feature (this is the escape hatch for the long
++tail of AMD parts: `gfx908`, `gfx1032`, `gfx1150`, `gfx1250`, ...). An
++explicit `hip_gfx*` feature always wins over `HL_HIP_ARCH`: Halide's module,
++JIT and generator caches are keyed on the target string, so the environment
++is never allowed to change what a given target string compiles to.
+ 
+ Unlike the CUDA backend, where PTX is forward-compatible and a missing
+ `cuda_capability_*` is tolerated, **an AMD code object only runs on the exact
+@@ -134,8 +139,12 @@ architecture it was compiled for**. Therefore:
+   explicit, e.g. `target=host-hip-hip_gfx942`.
+ - **JIT**: `HL_JIT_TARGET=host-hip` autodetects the architecture of the GPU in
+   the machine (through `halide_hip_compute_capability`, which reports the
+-  device's `gcnArchName`). If the detected architecture has no `hip_gfx*`
+-  feature you will get a warning telling you to set `HL_HIP_ARCH`.
++  device's `gcnArchName`). Autodetection only runs for `host` targets that
++  have neither a `hip_gfx*` feature nor `HL_HIP_ARCH` set. If the detected
++  architecture has no `hip_gfx*` feature you will get a warning telling you
++  to set `HL_HIP_ARCH`; if no HIP library or device is found the target
++  silently stays plain `hip` (and compiling for it is then an error, as
++  above).
+ 
+ Wave (warp) size follows the architecture: gfx9 parts run 64 lanes per wave,
+ gfx10 and newer are compiled in wave32 mode. This limits `gpu_lanes()`: the
+@@ -165,14 +174,14 @@ Compile-time (read while Halide generates code):
+ 
+ | Variable                     | Effect                                                                                                                                                                     |
+ | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| `HL_HIP_ARCH`                | `gfxNNNN[:feature...]` — architecture (and target features such as `xnack-`, `sramecc+`) to compile for. Overrides any `hip_gfx*` feature.                                 |
++| `HL_HIP_ARCH`                | `gfxNNNN[:feature...]` — architecture (and target features such as `xnack-`, `sramecc+`) to compile for. Consulted only when the target has no `hip_gfx*` feature; an explicit `hip_gfx*` feature always wins. |
+ | `HL_HIP_MATTRS`              | Extra comma-separated LLVM target attributes appended to the ones Halide derives (`+wavefrontsize32` on gfx10+).                                                            |
+ | `HL_HIP_CODE_OBJECT_VERSION` | `4`, `5` (default) or `6`. Selects the AMDHSA code object version. `6` is required for `gfx*-generic` targets and needs ROCm 6.3+.                                          |
+-| `HL_HIP_USE_EXTERNAL_LLD`    | `1` — link the device object with an external `ld.lld` process instead of the in-process lld library (diagnostic fallback).                                                 |
+-| `HL_HIP_LLD`                 | Path to the `ld.lld` executable to use when `HL_HIP_USE_EXTERNAL_LLD=1` (or when Halide was built without the lld libraries). Default: `ld.lld` on `PATH`.                 |
+-| `HL_HIP_DUMP_OBJ`            | Directory in which to write every generated device object (`<kernel-module>.o`, the pre-link ET_REL object) and code object (`<kernel-module>.hsaco`). Useful for inspection. |
++| `HL_HIP_USE_EXTERNAL_LLD`    | `1` — link the device object by running an external `ld.lld` process instead of the in-process lld library (diagnostic fallback). Halide also switches to the external linker by itself, for the rest of the process, if an in-process link ever fails fatally. |
++| `HL_HIP_LLD`                 | Path of the `ld.lld` executable used for external links (see `HL_HIP_USE_EXTERNAL_LLD`). It must come from the same LLVM version Halide was built with. Default: `ld.lld` on `PATH`. |
++| `HL_HIP_DUMP_OBJ`            | Existing directory in which to write every generated device object (`<kernel-module>.o`, the pre-link ET_REL object) and code object (`<kernel-module>.hsaco`). Useful for inspection; naming a directory that does not exist is an error. |
+ | `HL_JIT_TARGET`              | Standard Halide JIT target string, e.g. `host-hip-hip_gfx942` or `host-hip`.                                                                                                |
+-| `HL_DEBUG_CODEGEN=2`         | Standard Halide codegen tracing; level 2 prints the device LLVM IR before optimization.                                                                                     |
++| `HL_DEBUG_CODEGEN=2`         | Standard Halide codegen tracing; level 2 dumps the device LLVM IR after the optimization and codegen pipelines have run on it (i.e. what the object was emitted from), plus the object sizes. |
+ 
+ Run-time (read by the Halide runtime in the generated code):
+ 
+@@ -226,10 +235,13 @@ Phase 1 implements:
+ - Device code generation (`src/CodeGen_AMDGPU_Dev.cpp`): `amdgpu_kernel`
+   calling convention, work-item / work-group id intrinsics, fenced
+   `s_barrier`, dynamic LDS for `MemoryType::GPUShared`, private allocations,
+-  `f16`/`f32`/`f64` math through LLVM intrinsics (`src/runtime/amdgpu_dev.ll`),
+-  integer and floating-point atomics, warp shuffles for `gpu_lanes()` (wave32
+-  and wave64), traps for in-kernel assertions, COV5 code objects linked to
+-  `ET_DYN` with lld in-process.
++  integer and floating-point atomics, traps for in-kernel assertions, COV5
++  code objects linked to `ET_DYN` with lld in-process.
++- Device math (`src/runtime/amdgpu_dev.ll`) and warp shuffles for
++  `gpu_lanes()` (wave32 and wave64) are being completed in separate patches
++  (tasks T5 and T7 of the patch series); their current state is recorded in
++  the series' `STATUS.md`, not here. The math that is available today is
++  listed under "Known Limitations".
+ - Runtime (`src/runtime/hip.cpp`, `HalideRuntimeHIP.h`): dynamic loading of
+   `libamdhip64`, module cache, `halide_hip_run`, device malloc with free-list
+   reuse, strided copies (`hipDrvMemcpy3D` when available), crops/slices,
+@@ -264,9 +276,23 @@ hardware test results are published.
+   primitive for them on any GPU backend.
+ - **No cooperative groups, no HIP graphs, no multi-stream overlap** beyond what
+   Halide's `async()` / device-copy machinery provides.
+-- Fine-grained (host-coherent) memory is not used; all device allocations are
+-  `hipMalloc` (coarse-grained), which is what hardware floating-point atomics
+-  require.
++- **In-kernel assertions abort the process (to be confirmed on hardware).**
++  Halide lowers `AssertStmt`s inside GPU kernels to a trap (`s_trap 2`, from
++  `llvm.trap`). On ROCm a wave trap is reported through the HSA queue error
++  callback, which logs it and typically aborts the process; it is *not* the
++  recoverable launch error (`CUDA_ERROR_LAUNCH_FAILED`) the CUDA backend turns
++  into a Halide error code. Pipelines that rely on catching in-kernel
++  assertion failures (`test/correctness/gpu_assertion_in_kernel.cpp` is
++  CUDA-only for this reason) behave differently on HIP. A device-side error
++  flag is the longer-term fix.
++- **Atomics assume coarse-grained memory.** Every device allocation Halide
++  makes is `hipMalloc` (coarse-grained), and atomics are compiled with the
++  `!amdgpu.no.fine.grained.memory` annotation that hardware floating-point
++  atomics require. Buffers wrapped around externally allocated device memory
++  with `halide_hip_wrap_device_ptr` must also be coarse-grained: wrapping
++  fine-grained memory (`hipMallocManaged`, `hipHostMalloc` / host-pinned,
++  other host-coherent allocations) may cause floating-point atomic updates
++  to be silently dropped on MI200 / MI300 (`gfx90a` / `gfx94x`) hardware.
+ - `gfx*-generic` targets require `HL_HIP_CODE_OBJECT_VERSION=6` and ROCm 6.3+;
+   not tested.
+ - Performance has not been tuned at all.
+@@ -303,5 +329,8 @@ hardware test results are published.
+ - **Barriers** are `fence syncscope("workgroup") release; s_barrier; fence
+   syncscope("workgroup") acquire` — `s_barrier` alone is not a memory fence on
+   AMDGPU.
+-- **Denormals** are flushed (`denormal-fp-math-f32=preserve-sign`) unless the
+-  target has `strict_float`, matching the CUDA backend's `ftz` behaviour.
++- **Denormals.** `f32` denormals are flushed to zero
++  (`denormal-fp-math-f32=preserve-sign`) unless the target has `strict_float`,
++  for parity with the CUDA backend's `ftz` behaviour. This is a Halide
++  choice, not the platform default: clang's HIP compilation defaults to IEEE
++  denormals on gfx9 and later.
+diff --git a/doc/guides.md b/doc/guides.md
+index e483e17..a5a6a47 100644
+--- a/doc/guides.md
++++ b/doc/guides.md
+@@ -11,6 +11,7 @@ CustomRuntimes
+ FuzzTesting
+ GeneratorCache
+ Hexagon
++HIP
+ Python
+ RunGen
+ Testing
+diff --git a/python_bindings/halide/src/halide_/PyEnums.cpp b/python_bindings/halide/src/halide_/PyEnums.cpp
+index d0c7d3f..d4ebd27 100644
+--- a/python_bindings/halide/src/halide_/PyEnums.cpp
++++ b/python_bindings/halide/src/halide_/PyEnums.cpp
+@@ -23,12 +23,12 @@ void define_enums(py::module &m) {
+         .value("Host", DeviceAPI::Host)
+         .value("Default_GPU", DeviceAPI::Default_GPU)
+         .value("CUDA", DeviceAPI::CUDA)
+-        .value("HIP", DeviceAPI::HIP)
+         .value("Vulkan", DeviceAPI::Vulkan)
+         .value("OpenCL", DeviceAPI::OpenCL)
+         .value("Metal", DeviceAPI::Metal)
+         .value("Hexagon", DeviceAPI::Hexagon)
+-        .value("SMEStreaming", DeviceAPI::SMEStreaming);
++        .value("SMEStreaming", DeviceAPI::SMEStreaming)
++        .value("HIP", DeviceAPI::HIP);
+ 
+     py::enum_<LinkageType>(m, "LinkageType")
+         .value("External", LinkageType::External)
+diff --git a/src/CodeGen_AMDGPU_Dev.cpp b/src/CodeGen_AMDGPU_Dev.cpp
+index 812e674..79eb01a 100644
+--- a/src/CodeGen_AMDGPU_Dev.cpp
++++ b/src/CodeGen_AMDGPU_Dev.cpp
+@@ -178,7 +178,8 @@ protected:
+     std::string simt_intrinsic(const std::string &name);
+ 
+     /** The target-id ("gfx942", "gfx1100:xnack-", ...) this module is being
+-     * compiled for. HL_HIP_ARCH wins over the hip_gfx* target feature. */
++     * compiled for. An explicit hip_gfx* target feature wins; HL_HIP_ARCH is
++     * consulted only when the target has no hip_gfx* feature. */
+     HipArch hip_arch() const;
+ 
+     /** Build the TargetMachine for this module. Its data layout is the one
+@@ -610,8 +611,10 @@ void CodeGen_AMDGPU_Dev::visit(const Free *f) {
+ 
+ void CodeGen_AMDGPU_Dev::visit(const AssertStmt *op) {
+     // Discard the error message for now. halide_amdgpu_trap (amdgpu_dev.ll)
+-    // is llvm.trap, i.e. s_trap 2: the wave is killed and the runtime sees
+-    // the dispatch fail on the next synchronization.
++    // is llvm.trap, i.e. s_trap 2. Note this is NOT the recoverable launch
++    // error CUDA reports: on ROCm a wave trap is delivered through the HSA
++    // queue error callback, which logs it and typically aborts the process
++    // (to be confirmed on hardware). See "Known Limitations" in doc/HIP.md.
+     Expr trap = Call::make(Int(32), "halide_amdgpu_trap", {}, Call::Extern);
+     codegen(IfThenElse::make(!op->condition, Evaluate::make(trap)));
+ }
+@@ -643,17 +646,19 @@ void CodeGen_AMDGPU_Dev::visit(const Atomic *op) {
+ }
+ 
+ HipArch CodeGen_AMDGPU_Dev::hip_arch() const {
+-    // The environment variable is the long tail: any gfx name LLVM knows,
+-    // optionally with target-id features, and it wins over the target string.
+-    string env = get_env_variable("HL_HIP_ARCH");
+-    if (!env.empty()) {
+-        return parse_hip_arch(env);
++    // An explicit hip_gfx* feature wins: Module/JIT/generator caches are
++    // keyed on the target string, so the environment must not change what
++    // a given target string compiles to.
++    if (target.get_hip_arch_feature() != Target::FeatureEnd) {
++        return parse_hip_arch(target.get_hip_arch_string());
+     }
+-    string arch = target.get_hip_arch_string();
+-    user_assert(!arch.empty())
++    // Otherwise the environment variable is the long tail: any gfx name LLVM
++    // knows, optionally with ':'-separated target-id features.
++    string env = get_env_variable("HL_HIP_ARCH");
++    user_assert(!env.empty())
+         << "hip target requires a hip_gfx* feature or HL_HIP_ARCH "
+         << "(e.g. HL_HIP_ARCH=gfx942) to select the GPU architecture.\n";
+-    return parse_hip_arch(arch);
++    return parse_hip_arch(env);
+ }
+ 
+ string CodeGen_AMDGPU_Dev::mcpu_target() const {
+@@ -741,6 +746,8 @@ void dump_code_object(const string &dir, const string &stem, const string &ext,
+     if (dir.empty()) {
+         return;
+     }
++    user_assert(file_exists(dir))
++        << "HL_HIP_DUMP_OBJ names a directory that does not exist: " << dir << "\n";
+     static std::mutex dump_mutex;
+     static std::map<string, int> seen;
+     string name;
+@@ -803,9 +810,16 @@ vector<char> CodeGen_AMDGPU_Dev::link_code_object(const vector<char> &object) {
+                        << "Set HL_HIP_LLD to the path of an ld.lld from the same LLVM "
+                        << "version as Halide, or unset HL_HIP_USE_EXTERNAL_LLD.\n";
+         }
+-        internal_assert(rc == 0)
+-            << lld_path << " failed with exit code " << rc << " while linking the HIP code object:\n"
+-            << log_str;
++        // A non-zero exit is the linker rejecting the object (most likely an
++        // ld.lld from a different LLVM version than Halide's), not a Halide
++        // bug: report it with the linker's own diagnostics.
++        if (rc != 0) {
++            user_error << lld_path << " failed with exit code " << rc
++                       << " while linking the HIP code object:\n"
++                       << log_str
++                       << "Set HL_HIP_LLD to the path of an ld.lld from the same LLVM "
++                       << "version as Halide (" << LLVM_VERSION_STRING << ").\n";
++        }
+         if (!log_str.empty()) {
+             debug(1) << lld_path << ": " << log_str << "\n";
+         }
+@@ -849,12 +863,13 @@ vector<char> CodeGen_AMDGPU_Dev::link_code_object(const vector<char> &object) {
+         if (!lld_stdout.empty()) {
+             debug(1) << "ld.lld: " << lld_stdout << "\n";
+         }
+-        internal_assert(r.retCode == 0 && r.canRunAgain)
+-            << "In-process ld.lld failed to link the HIP code object (exit code " << r.retCode
+-            << (r.canRunAgain ? "" : ", fatal") << "):\n"
+-            << lld_stderr
+-            << "Set HL_HIP_USE_EXTERNAL_LLD=1 (and HL_HIP_LLD=/path/to/ld.lld) to link "
+-            << "with an external ld.lld instead.\n";
++        if (r.retCode != 0 || !r.canRunAgain) {
++            user_error << "In-process ld.lld failed to link the HIP code object (exit code " << r.retCode
++                       << (r.canRunAgain ? "" : ", fatal") << "):\n"
++                       << lld_stderr
++                       << "Set HL_HIP_USE_EXTERNAL_LLD=1 (and HL_HIP_LLD=/path/to/ld.lld) to link "
++                       << "with an external ld.lld instead.\n";
++        }
+         if (!lld_stderr.empty()) {
+             debug(1) << "ld.lld: " << lld_stderr << "\n";
+         }
+@@ -997,10 +1012,10 @@ bool CodeGen_AMDGPU_Dev::supports_atomic_add(const Type &t) const {
+         return true;
+     }
+     if (t.is_float() && t.bits() == 64) {
+-        // Hardware f64 atomics are a CDNA (gfx90a/gfx942/gfx950) feature.
+-        // TODO(T7): refine per-arch; CAS fallback would make this always true.
+-        const string mcpu = mcpu_target();
+-        return mcpu == "gfx90a" || starts_with(mcpu, "gfx94") || starts_with(mcpu, "gfx95");
++        // Hardware f64 atomics are a CDNA (gfx90a/gfx942/gfx950) feature;
++        // everywhere else LLVM expands atomicrmw fadd double to a
++        // compare-and-swap loop, so it is always supported.
++        return true;
+     }
+     return false;
+ }
+diff --git a/src/CodeGen_C.cpp b/src/CodeGen_C.cpp
+index cd53706..45026bf 100644
+--- a/src/CodeGen_C.cpp
++++ b/src/CodeGen_C.cpp
+@@ -31,6 +31,7 @@ using std::vector;
+ extern "C" unsigned char halide_internal_initmod_inlined_c[];
+ extern "C" unsigned char halide_internal_runtime_header_HalideRuntime_h[];
+ extern "C" unsigned char halide_internal_runtime_header_HalideRuntimeCuda_h[];
++extern "C" unsigned char halide_internal_runtime_header_HalideRuntimeHIP_h[];
+ extern "C" unsigned char halide_internal_runtime_header_HalideRuntimeHexagonHost_h[];
+ extern "C" unsigned char halide_internal_runtime_header_HalideRuntimeMetal_h[];
+ extern "C" unsigned char halide_internal_runtime_header_HalideRuntimeOpenCL_h[];
+@@ -387,6 +388,9 @@ CodeGen_C::~CodeGen_C() {
+             if (target.has_feature(Target::CUDA)) {
+                 stream << normalize_line_endings(halide_internal_runtime_header_HalideRuntimeCuda_h) << "\n";
+             }
++            if (target.has_feature(Target::HIP)) {
++                stream << normalize_line_endings(halide_internal_runtime_header_HalideRuntimeHIP_h) << "\n";
++            }
+             if (target.has_feature(Target::HVX)) {
+                 stream << normalize_line_endings(halide_internal_runtime_header_HalideRuntimeHexagonHost_h) << "\n";
+             }
+diff --git a/src/DeviceAPI.h b/src/DeviceAPI.h
+index f25bcf0..2dc035e 100644
+--- a/src/DeviceAPI.h
++++ b/src/DeviceAPI.h
+@@ -17,7 +17,6 @@ enum class DeviceAPI {
+     Host,
+     Default_GPU,
+     CUDA,
+-    HIP,
+     OpenCL,
+     Metal,
+     Hexagon,
+@@ -26,6 +25,7 @@ enum class DeviceAPI {
+     Vulkan,
+     WebGPU,
+     SMEStreaming,
++    HIP,
+ };
+ 
+ /** An array containing all the device apis. Useful for iterating
+@@ -34,7 +34,6 @@ const DeviceAPI all_device_apis[] = {DeviceAPI::None,
+                                      DeviceAPI::Host,
+                                      DeviceAPI::Default_GPU,
+                                      DeviceAPI::CUDA,
+-                                     DeviceAPI::HIP,
+                                      DeviceAPI::OpenCL,
+                                      DeviceAPI::Metal,
+                                      DeviceAPI::Hexagon,
+@@ -42,7 +41,8 @@ const DeviceAPI all_device_apis[] = {DeviceAPI::None,
+                                      DeviceAPI::D3D12Compute,
+                                      DeviceAPI::Vulkan,
+                                      DeviceAPI::WebGPU,
+-                                     DeviceAPI::SMEStreaming};
++                                     DeviceAPI::SMEStreaming,
++                                     DeviceAPI::HIP};
+ 
+ }  // namespace Halide
+ 
+diff --git a/src/IRPrinter.cpp b/src/IRPrinter.cpp
+index 19d3dab..1f79dfa 100644
+--- a/src/IRPrinter.cpp
++++ b/src/IRPrinter.cpp
+@@ -77,7 +77,10 @@ ostream &operator<<(ostream &stream, const Tuple &ir) {
+ ostream &operator<<(ostream &stream, const Buffer<> &buffer) {
+     bool include_data = Internal::ends_with(buffer.name(), "_gpu_source_kernels");
+     stream << "buffer " << buffer.name() << " = {";
+-    if (include_data) {
++    if (include_data && Internal::starts_with(buffer.name(), "hip_")) {
++        // HIP device code is a binary HSA code object, not text.
++        stream << "<binary HSA code object, " << buffer.size_in_bytes() << " bytes>";
++    } else if (include_data) {
+         std::string str((const char *)buffer.data(), buffer.size_in_bytes());
+         stream << "\n"
+                << str << "\n";
+diff --git a/src/StmtToHTML.cpp b/src/StmtToHTML.cpp
+index b0fae24..1e1a2ba 100644
+--- a/src/StmtToHTML.cpp
++++ b/src/StmtToHTML.cpp
+@@ -2620,7 +2620,13 @@ private:
+             length--;
+         }
+         std::string str((const char *)buf.data(), length);
+-        if (starts_with(buf.name(), "cuda_")) {
++        if (starts_with(buf.name(), "hip_")) {
++            // HIP device code is a binary HSA code object, not text.
++            stream << "<div class='code'>\n"
++                   << "<span class='line'>&lt;binary HSA code object, " << buf.size_in_bytes()
++                   << " bytes&gt;</span>\n"
++                   << "</div>\n";
++        } else if (starts_with(buf.name(), "cuda_")) {
+             html_code_printer.print_cuda_gpu_source_kernels(str);
+         } else {
+             std::istringstream ss{str};
+diff --git a/src/Target.cpp b/src/Target.cpp
+index 622655e..3539d1c 100644
+--- a/src/Target.cpp
++++ b/src/Target.cpp
+@@ -439,6 +439,11 @@ Target::Feature calculate_host_hip_arch(Target t) {
+                      << "explicit hip_gfx* target feature.\n";
+         return Target::FeatureEnd;
+     }
++    if (major == 0 && minor == 0) {
++        // No HIP library or no HIP device: nothing to autodetect, and
++        // nothing worth warning about (the target just stays plain 'hip').
++        return Target::FeatureEnd;
++    }
+     // halide_hip_compute_capability() encodes the device's gfx id as
+     // major = gfx generation and minor = the low byte of the gfx id, i.e.
+     // gfx90a -> (9, 0x0a), gfx942 -> (9, 0x42), gfx950 -> (9, 0x50),
+@@ -863,7 +868,9 @@ bool merge_string(Target &t, const std::string &target) {
+         t.has_feature(Target::HIP) &&
+         t.get_hip_arch_feature() == Target::FeatureEnd &&
+         Internal::get_env_variable("HL_HIP_ARCH").empty()) {
+-        // Detect host hip architecture (HL_HIP_ARCH, when set, overrides any hip_gfx* feature)
++        // Detect host hip architecture. Only done when neither an explicit
++        // hip_gfx* feature nor HL_HIP_ARCH names one; a hip_gfx* feature
++        // always wins over the environment variable.
+         t.set_feature(get_host_hip_arch(t));
+     }
+ 
+@@ -1507,13 +1514,13 @@ Target::Feature Target::get_hip_arch_feature() const {
+ }
+ 
+ std::string Target::get_hip_arch_string() const {
+-    // HL_HIP_ARCH=<gfxNNN[:xnack-][:sramecc+]> overrides any hip_gfx* feature.
+-    // Only the -mcpu part is returned here; the AMDGPU codegen reads any
+-    // ':'-separated target attribute suffixes from the variable itself.
+-    const std::string env_arch = Internal::get_env_variable("HL_HIP_ARCH");
+-    if (!env_arch.empty()) {
+-        return env_arch.substr(0, env_arch.find(':'));
+-    }
++    // An explicit hip_gfx* feature always wins: Module, JIT and generator
++    // caches are keyed on the target string, so the environment must not be
++    // able to change what a given target string compiles to.
++    // HL_HIP_ARCH=<gfxNNN[:xnack-][:sramecc+]> is only consulted when no
++    // hip_gfx* feature is set. Only the -mcpu part is returned here; the
++    // AMDGPU codegen reads any ':'-separated target attribute suffixes from
++    // the variable itself.
+     switch (get_hip_arch_feature()) {
+     case HIPGFX90A:
+         return "gfx90a";
+@@ -1530,8 +1537,10 @@ std::string Target::get_hip_arch_string() const {
+     case HIPGFX1201:
+         return "gfx1201";
+     default:
+-        return "";
++        break;
+     }
++    const std::string env_arch = Internal::get_env_variable("HL_HIP_ARCH");
++    return env_arch.substr(0, env_arch.find(':'));
+ }
+ 
+ int Target::get_vulkan_capability_lower_bound() const {
+diff --git a/src/Target.h b/src/Target.h
+index b8bc68d..b792353 100644
+--- a/src/Target.h
++++ b/src/Target.h
+@@ -407,11 +407,12 @@ struct Target {
+     Feature get_hip_arch_feature() const;
+ 
+     /** Return the LLVM -mcpu name of the AMD GPU architecture this Target
+-     * compiles HIP kernels for, e.g. "gfx942". If the HL_HIP_ARCH environment
+-     * variable is set it takes precedence over any hip_gfx* feature; only the
+-     * part of it before the first ':' is returned (any ":xnack-"/":sramecc+"
+-     * suffixes are target attributes that the AMDGPU codegen reads from the
+-     * variable itself). Returns an empty string if neither is set. */
++     * compiles HIP kernels for, e.g. "gfx942". An explicit hip_gfx* feature
++     * always wins; the HL_HIP_ARCH environment variable is consulted only
++     * when no hip_gfx* feature is set. Only the part of it before the first
++     * ':' is returned (any ":xnack-"/":sramecc+" suffixes are target
++     * attributes that the AMDGPU codegen reads from the variable itself).
++     * Returns an empty string if neither is set. */
+     std::string get_hip_arch_string() const;
+ 
+     /** Get the minimum Vulkan capability found as an integer. Returns
+diff --git a/src/runtime/HalideRuntimeHIP.h b/src/runtime/HalideRuntimeHIP.h
+index bed80a8..e461282 100644
+--- a/src/runtime/HalideRuntimeHIP.h
++++ b/src/runtime/HalideRuntimeHIP.h
+@@ -44,7 +44,14 @@ extern void halide_hip_finalize_kernels(void *user_context, void *state_ptr);
+  * halide_buffer_t extent fields. The dev field of the halide_buffer_t
+  * must be NULL when this routine is called. This call can fail due to
+  * being passed an invalid device pointer. The device and host dirty
+- * bits are left unmodified. */
++ * bits are left unmodified.
++ *
++ * Halide compiles atomic updates assuming coarse-grained device memory
++ * (what hipMalloc returns). Wrapping fine-grained memory (hipMallocManaged,
++ * hipHostMalloc / host-pinned or other host-coherent allocations) is
++ * allowed for ordinary loads and stores, but floating-point atomics into
++ * such memory may be silently dropped on MI200 / MI300 (gfx90a / gfx94x)
++ * hardware. */
+ extern int halide_hip_wrap_device_ptr(void *user_context, struct halide_buffer_t *buf, uint64_t device_ptr);
+ 
+ /** Disconnect this halide_buffer_t from the device pointer it was
+diff --git a/src/runtime/hip.cpp b/src/runtime/hip.cpp
+index 1d7dd06..9f3fdfd 100644
+--- a/src/runtime/hip.cpp
++++ b/src/runtime/hip.cpp
+@@ -771,6 +771,14 @@ WEAK int halide_hip_device_release(void *user_context) {
+     }
+ 
+     if (device >= 0) {
++        // The current device is per-thread state shared with any other HIP
++        // user in this process, so save it and restore it on the way out.
++        int previous_device = -1;
++        if (hipGetDevice(&previous_device) != hipSuccess) {
++            previous_device = -1;
++        }
++        const bool restore_device = (previous_device >= 0 && previous_device != device);
++
+         // It's possible that this is being called from the destructor of
+         // a static variable, in which case the runtime may already be
+         // shutting down.
+@@ -779,6 +787,9 @@ WEAK int halide_hip_device_release(void *user_context) {
+             err = hipDeviceSynchronize();
+         }
+         if (err != hipSuccess && err != hipErrorDeinitialized) {
++            if (restore_device) {
++                (void)hipSetDevice(previous_device);
++            }
+             return error_hip(user_context, err);
+         }
+ 
+@@ -799,6 +810,10 @@ WEAK int halide_hip_device_release(void *user_context) {
+                 context_device = -1;
+             }
+         }  // spinlock
++
++        if (restore_device) {
++            (void)hipSetDevice(previous_device);
++        }
+     }
+ 
+     return halide_hip_release_context(user_context);
+@@ -1279,7 +1294,16 @@ WEAK int halide_hip_run(void *user_context,
+     while (arg_sizes[num_args] != 0) {
+         debug(user_context) << "    halide_hip_run " << (int)num_args
+                             << " " << (int)arg_sizes[num_args]
+-                            << " [" << (*((void **)args[num_args])) << " ...] "
++                            << " [";
++        // Print exactly the bytes of the argument (a scalar may be smaller
++        // than a pointer, so don't read it as one).
++        const uint8_t *arg_bytes = (const uint8_t *)args[num_args];
++        for (size_t b = 0; b < arg_sizes[num_args] && b < 16; b++) {
++            const char *const hex_digits = "0123456789abcdef";
++            char byte_str[3] = {hex_digits[arg_bytes[b] >> 4], hex_digits[arg_bytes[b] & 0xf], '\0'};
++            debug(user_context) << (b ? " " : "") << byte_str;
++        }
++        debug(user_context) << (arg_sizes[num_args] > 16 ? " ...] " : "] ")
+                             << arg_is_buffer[num_args] << "\n";
+         num_args++;
+     }
+@@ -1627,8 +1651,12 @@ WEAK const char *get_hip_error_name(hipError_t err) {
+     // Errors with Halide-specific meaning first; then the runtime's own
+     // table when we have it; then our static table.
+     switch (err) {
+-    // A trap instruction (s_trap 2, from llvm.trap) surfaces as a launch
+-    // failure on the next synchronization, which is how we codegen asserts on GPU.
++    // In-kernel Halide assertions are lowered to a trap instruction (s_trap 2,
++    // from llvm.trap). On ROCm a wave trap is reported through the HSA queue
++    // error callback, which logs it and typically aborts the process, so
++    // unlike CUDA's recoverable launch error it will usually never reach this
++    // code (to be confirmed on hardware). The message below covers the case
++    // where the runtime does report it as a launch failure instead.
+     case hipErrorLaunchFailure:
+         return "hipErrorLaunchFailure: illegal instruction or Halide assertion failure inside kernel";
+     case hipErrorNoBinaryForGpu:
+diff --git a/test/common/gpu_object_lifetime_tracker.h b/test/common/gpu_object_lifetime_tracker.h
+index 9c0ee1f..ff2de1b 100644
+--- a/test/common/gpu_object_lifetime_tracker.h
++++ b/test/common/gpu_object_lifetime_tracker.h
+@@ -22,7 +22,7 @@ class GpuObjectLifetimeTracker {
+         }
+     };
+ 
+-    std::array<ObjectType, 22> object_types = {{
++    std::array<ObjectType, 23> object_types = {{
+         {"Caching compiled kernel:", "Releasing cached compilation:"},
+ 
+         // OpenCL objects
+@@ -37,6 +37,10 @@ class GpuObjectLifetimeTracker {
+         {"cuCtxCreate", "cuCtxDestroy", true},
+         {"cuMemAlloc", "cuMemFree"},
+ 
++        // HIP objects. There is no per-process context object to track:
++        // the HIP runtime works directly with device ordinals.
++        {"hipMalloc", "hipFree"},
++
+         // Metal objects
+         {"Allocating: MTLCreateSystemDefaultDevice", "Releasing: MTLCreateSystemDefaultDevice", true},
+         {"Allocating: new_command_queue", "Releasing: new_command_queue"},
+diff --git a/test/correctness/hip_code_object.cpp b/test/correctness/hip_code_object.cpp
+index 0471662..0ab2550 100644
+--- a/test/correctness/hip_code_object.cpp
++++ b/test/correctness/hip_code_object.cpp
+@@ -4,7 +4,8 @@
+ // Module, and check the ELF the way hipModuleLoadData would.
+ //
+ // Tests only link against libHalide, which does not export LLVM's object
+-// library, so the ELF is parsed by hand below.
++// library, so the ELF (and the msgpack metadata note inside it) is parsed
++// by hand below.
+ 
+ #include "Halide.h"
+ 
+@@ -26,6 +27,7 @@ constexpr uint8_t ELFOSABI_AMDGPU_HSA = 64;
+ constexpr uint32_t SHT_SYMTAB = 2;
+ constexpr uint32_t SHT_RELA = 4;
+ constexpr uint32_t SHT_NOTE = 7;
++constexpr uint32_t SHT_REL = 9;
+ constexpr uint32_t SHT_DYNSYM = 11;
+ constexpr uint64_t SHF_ALLOC = 2;
+ constexpr uint16_t SHN_UNDEF = 0;
+@@ -239,6 +241,222 @@ private:
+     }
+ };
+ 
++// A minimal msgpack decoder: just enough of the format to walk the AMDGPU
++// metadata note (maps, arrays, strings and integers; other types are
++// skipped and reported as Other).
++struct Msgpack {
++    enum Kind { Nil,
++                Bool,
++                Int,
++                Str,
++                Array,
++                Map,
++                Other };
++    Kind kind = Nil;
++    int64_t i = 0;
++    std::string s;
++    std::vector<Msgpack> items;                        // Array
++    std::vector<std::pair<Msgpack, Msgpack>> entries;  // Map
++
++    // Map lookup by string key; nullptr if absent (or not a map).
++    const Msgpack *get(const std::string &key) const {
++        if (kind != Map) {
++            return nullptr;
++        }
++        for (const auto &e : entries) {
++            if (e.first.kind == Str && e.first.s == key) {
++                return &e.second;
++            }
++        }
++        return nullptr;
++    }
++    bool is_int(int64_t v) const {
++        return kind == Int && i == v;
++    }
++    bool is_str(const std::string &v) const {
++        return kind == Str && s == v;
++    }
++};
++
++class MsgpackReader {
++public:
++    explicit MsgpackReader(const std::string &buf)
++        : buf(buf) {
++    }
++
++    bool read(Msgpack &out) {
++        if (!need(1)) {
++            return false;
++        }
++        uint8_t b = (uint8_t)buf[pos++];
++        if (b <= 0x7f) {  // positive fixint
++            out.kind = Msgpack::Int;
++            out.i = b;
++            return true;
++        }
++        if (b >= 0xe0) {  // negative fixint
++            out.kind = Msgpack::Int;
++            out.i = (int8_t)b;
++            return true;
++        }
++        if ((b & 0xf0) == 0x80) {  // fixmap
++            return read_map(out, b & 0x0f);
++        }
++        if ((b & 0xf0) == 0x90) {  // fixarray
++            return read_array(out, b & 0x0f);
++        }
++        if ((b & 0xe0) == 0xa0) {  // fixstr
++            return read_str(out, b & 0x1f);
++        }
++        switch (b) {
++        case 0xc0:
++            out.kind = Msgpack::Nil;
++            return true;
++        case 0xc2:
++        case 0xc3:
++            out.kind = Msgpack::Bool;
++            out.i = (b == 0xc3);
++            return true;
++        case 0xc4:  // bin 8/16/32: skipped
++        case 0xc5:
++        case 0xc6: {
++            size_t n = (size_t)1 << (b - 0xc4);
++            if (!need(n)) {
++                return false;
++            }
++            uint64_t len = be(n);
++            if (!need(len)) {
++                return false;
++            }
++            pos += (size_t)len;
++            out.kind = Msgpack::Other;
++            return true;
++        }
++        case 0xca:  // float 32/64: skipped
++        case 0xcb: {
++            size_t n = (b == 0xca) ? 4 : 8;
++            if (!need(n)) {
++                return false;
++            }
++            pos += n;
++            out.kind = Msgpack::Other;
++            return true;
++        }
++        case 0xcc:  // uint 8/16/32/64
++        case 0xcd:
++        case 0xce:
++        case 0xcf: {
++            size_t n = (size_t)1 << (b - 0xcc);
++            if (!need(n)) {
++                return false;
++            }
++            out.kind = Msgpack::Int;
++            out.i = (int64_t)be(n);
++            return true;
++        }
++        case 0xd0:  // int 8/16/32/64
++        case 0xd1:
++        case 0xd2:
++        case 0xd3: {
++            size_t n = (size_t)1 << (b - 0xd0);
++            if (!need(n)) {
++                return false;
++            }
++            int shift = 64 - 8 * (int)n;
++            out.kind = Msgpack::Int;
++            out.i = (int64_t)(be(n) << shift) >> shift;  // sign-extend
++            return true;
++        }
++        case 0xd9:  // str 8/16/32
++        case 0xda:
++        case 0xdb: {
++            size_t n = (size_t)1 << (b - 0xd9);
++            if (!need(n)) {
++                return false;
++            }
++            return read_str(out, be(n));
++        }
++        case 0xdc:  // array 16/32
++        case 0xdd: {
++            size_t n = (size_t)2 << (b - 0xdc);
++            if (!need(n)) {
++                return false;
++            }
++            return read_array(out, be(n));
++        }
++        case 0xde:  // map 16/32
++        case 0xdf: {
++            size_t n = (size_t)2 << (b - 0xde);
++            if (!need(n)) {
++                return false;
++            }
++            return read_map(out, be(n));
++        }
++        default:  // ext types: not used by the AMDGPU metadata
++            return false;
++        }
++    }
++
++private:
++    const std::string &buf;
++    size_t pos = 0;
++
++    bool need(uint64_t n) const {
++        return pos <= buf.size() && n <= buf.size() - pos;
++    }
++    // Big-endian unsigned integer of n bytes.
++    uint64_t be(size_t n) {
++        uint64_t v = 0;
++        for (size_t k = 0; k < n; k++) {
++            v = (v << 8) | (uint8_t)buf[pos++];
++        }
++        return v;
++    }
++    bool read_str(Msgpack &out, uint64_t len) {
++        if (!need(len)) {
++            return false;
++        }
++        out.kind = Msgpack::Str;
++        out.s.assign(buf.data() + pos, (size_t)len);
++        pos += (size_t)len;
++        return true;
++    }
++    bool read_array(Msgpack &out, uint64_t n) {
++        out.kind = Msgpack::Array;
++        for (uint64_t k = 0; k < n; k++) {
++            Msgpack v;
++            if (!read(v)) {
++                return false;
++            }
++            out.items.push_back(std::move(v));
++        }
++        return true;
++    }
++    bool read_map(Msgpack &out, uint64_t n) {
++        out.kind = Msgpack::Map;
++        for (uint64_t k = 0; k < n; k++) {
++            Msgpack key, value;
++            if (!read(key) || !read(value)) {
++                return false;
++            }
++            out.entries.emplace_back(std::move(key), std::move(value));
++        }
++        return true;
++    }
++};
++
++// What a kernel's .args metadata must say, entry by entry.
++struct ExpectedArg {
++    const char *value_kind;
++    int64_t offset, size;
++    const char *name;  // nullptr: don't check (Halide uniquifies some names per compile)
++};
++
++struct ExpectedKernel {
++    std::vector<ExpectedArg> args;
++    int64_t kernarg_segment_size;
++};
++
+ int failures = 0;
+ 
+ #define CHECK(cond, ...)                                            \
+@@ -259,7 +477,10 @@ uint8_t expected_abi_version() {
+     return (uint8_t)(v - 2);
+ }
+ 
+-void check_code_object(const Buffer<> &code, const char *label, uint32_t expected_mach) {
++// expected_kernel, when given, is checked against the .args metadata of the
++// (single) kernel in the code object.
++void check_code_object(const Buffer<> &code, const char *label, uint32_t expected_mach,
++                       const ExpectedKernel *expected_kernel = nullptr) {
+     CHECK(code.defined(), "no device code buffer was embedded in the Module");
+     if (!code.defined()) {
+         return;
+@@ -317,14 +538,87 @@ void check_code_object(const Buffer<> &code, const char *label, uint32_t expecte
+         }
+     }
+     CHECK(found_note, "no NT_AMDGPU_METADATA (type 32, name \"AMDGPU\") note");
++    // .kernarg_segment_size per kernel, as the metadata states it; compared
++    // with the kernel descriptor below.
++    std::vector<std::pair<std::string, int64_t>> md_kernarg_sizes;
+     if (found_note) {
+-        // msgpack encodes the map keys and string values verbatim, so a
+-        // substring search is enough to see the fields are there.
+-        CHECK(metadata.find("amdhsa.kernels") != std::string::npos, "metadata lacks amdhsa.kernels");
+-        CHECK(metadata.find(".kernarg_segment_size") != std::string::npos, "metadata lacks .kernarg_segment_size");
+-        CHECK(metadata.find(".args") != std::string::npos, "metadata lacks .args");
+-        for (const std::string &k : kernels) {
+-            CHECK(metadata.find(k) != std::string::npos, "metadata does not mention kernel %s", k.c_str());
++        // The note is a msgpack map: amdhsa.kernels -> array of kernel maps,
++        // each with .name, .args (array of maps with .value_kind / .offset /
++        // .size), .kernarg_segment_size, .group_segment_fixed_size, ...
++        Msgpack md;
++        MsgpackReader reader(metadata);
++        bool decoded = reader.read(md) && md.kind == Msgpack::Map;
++        CHECK(decoded, "NT_AMDGPU_METADATA payload is not a msgpack map");
++        const Msgpack *md_kernels = decoded ? md.get("amdhsa.kernels") : nullptr;
++        CHECK(md_kernels != nullptr && md_kernels->kind == Msgpack::Array, "metadata lacks an amdhsa.kernels array");
++        if (md_kernels != nullptr && md_kernels->kind == Msgpack::Array) {
++            CHECK(md_kernels->items.size() == kernels.size(),
++                  "metadata describes %zu kernels, the symbol table has %zu",
++                  md_kernels->items.size(), kernels.size());
++            for (const Msgpack &k : md_kernels->items) {
++                const Msgpack *name = k.get(".name");
++                const Msgpack *args = k.get(".args");
++                const Msgpack *kernarg_size = k.get(".kernarg_segment_size");
++                const Msgpack *group_size = k.get(".group_segment_fixed_size");
++                CHECK(name != nullptr && name->kind == Msgpack::Str, "a kernel in the metadata has no .name");
++                std::string kname = (name && name->kind == Msgpack::Str) ? name->s : "?";
++                bool known = false;
++                for (const std::string &sym : kernels) {
++                    known |= (sym == kname);
++                }
++                CHECK(known, "metadata names kernel %s, which is not an STT_FUNC symbol", kname.c_str());
++                CHECK(args != nullptr && args->kind == Msgpack::Array, "kernel %s has no .args array", kname.c_str());
++                CHECK(kernarg_size != nullptr && kernarg_size->kind == Msgpack::Int,
++                      "kernel %s has no .kernarg_segment_size", kname.c_str());
++                CHECK(group_size != nullptr && group_size->is_int(0),
++                      "kernel %s .group_segment_fixed_size is not 0 (dynamic LDS)", kname.c_str());
++                if (kernarg_size && kernarg_size->kind == Msgpack::Int) {
++                    md_kernarg_sizes.emplace_back(kname, kernarg_size->i);
++                }
++                if (!args || args->kind != Msgpack::Array) {
++                    continue;
++                }
++                for (size_t i = 0; i < args->items.size(); i++) {
++                    const Msgpack &a = args->items[i];
++                    const Msgpack *kind = a.get(".value_kind");
++                    const Msgpack *offset = a.get(".offset");
++                    const Msgpack *size = a.get(".size");
++                    const Msgpack *aname = a.get(".name");
++                    CHECK(kind && kind->kind == Msgpack::Str && offset && offset->kind == Msgpack::Int &&
++                              size && size->kind == Msgpack::Int,
++                          "kernel %s arg %zu lacks .value_kind/.offset/.size", kname.c_str(), i);
++                    if (!(kind && kind->kind == Msgpack::Str && offset && offset->kind == Msgpack::Int &&
++                          size && size->kind == Msgpack::Int)) {
++                        continue;
++                    }
++                    printf("[%s] %s arg %zu: %s %s offset=%lld size=%lld\n", label, kname.c_str(), i,
++                           kind->s.c_str(), (aname && aname->kind == Msgpack::Str) ? aname->s.c_str() : "?",
++                           (long long)offset->i, (long long)size->i);
++                    if (!expected_kernel || i >= expected_kernel->args.size()) {
++                        continue;
++                    }
++                    const ExpectedArg &e = expected_kernel->args[i];
++                    CHECK(kind->is_str(e.value_kind), "arg %zu .value_kind is %s, expected %s",
++                          i, kind->s.c_str(), e.value_kind);
++                    CHECK(offset->is_int(e.offset), "arg %zu .offset is %lld, expected %lld",
++                          i, (long long)offset->i, (long long)e.offset);
++                    CHECK(size->is_int(e.size), "arg %zu .size is %lld, expected %lld",
++                          i, (long long)size->i, (long long)e.size);
++                    if (e.name) {
++                        CHECK(aname && aname->is_str(e.name), "arg %zu .name is %s, expected %s",
++                              i, (aname && aname->kind == Msgpack::Str) ? aname->s.c_str() : "?", e.name);
++                    }
++                }
++                if (expected_kernel) {
++                    CHECK(args->items.size() == expected_kernel->args.size(),
++                          "kernel %s has %zu args, expected %zu",
++                          kname.c_str(), args->items.size(), expected_kernel->args.size());
++                    CHECK(kernarg_size && kernarg_size->is_int(expected_kernel->kernarg_segment_size),
++                          "kernel %s .kernarg_segment_size is %lld, expected %lld", kname.c_str(),
++                          (long long)(kernarg_size ? kernarg_size->i : -1),
++                          (long long)expected_kernel->kernarg_segment_size);
++                }
++            }
+         }
+     }
+ 
+@@ -348,24 +642,16 @@ void check_code_object(const Buffer<> &code, const char *label, uint32_t expecte
+         CHECK(!(s.name == "__halide_dynamic_lds" && s.shndx == SHN_UNDEF),
+               "__halide_dynamic_lds survived as an undefined symbol (dynamic LDS was not lowered)");
+     }
++    // Nor may anything be left for the loader to relocate: a Halide code
++    // object has no relocation entries at all (the 2018 AMDGPU attempt died
++    // on exactly these), whatever symbol they would be against.
+     for (const Section &s : elf.sections) {
+-        if (s.type != SHT_RELA || s.entsize != 24 || s.link >= elf.sections.size()) {
++        if (s.type != SHT_RELA && s.type != SHT_REL) {
+             continue;
+         }
+-        std::vector<Symbol> rsyms = elf.symbols(elf.sections[s.link]);
+-        for (uint64_t off = s.offset; off + 24 <= s.offset + s.size; off += 24) {
+-            uint64_t info = elf.u64((size_t)off + 8);
+-            uint32_t sym_idx = (uint32_t)(info >> 32);
+-            if (sym_idx == 0) {
+-                continue;  // base-relative (R_AMDGPU_RELATIVE64): resolved by the loader
+-            }
+-            const char *sym_name = sym_idx < rsyms.size() ? rsyms[sym_idx].name.c_str() : "?";
+-            bool undefined = sym_idx < rsyms.size() && rsyms[sym_idx].shndx == SHN_UNDEF;
+-            CHECK(!undefined, "%s has a relocation against undefined symbol %s", s.name.c_str(), sym_name);
+-            if (!undefined) {
+-                printf("[%s] note: %s has a symbolic relocation against %s\n", label, s.name.c_str(), sym_name);
+-            }
+-        }
++        uint64_t count = s.entsize ? s.size / s.entsize : s.size;
++        CHECK(count == 0, "%s has %llu relocation entries; a loadable code object must have none",
++              s.name.c_str(), (unsigned long long)count);
+     }
+ 
+     // Kernel descriptors: group_segment_fixed_size@0, private@4, kernarg_size@8.
+@@ -399,6 +685,15 @@ void check_code_object(const Buffer<> &code, const char *label, uint32_t expecte
+               k.c_str(), group_segment_fixed_size);
+         // Two buffer pointers (8 bytes each) at least.
+         CHECK(kernarg_size >= 16, "%s.kd kernarg_size is %u, expected >= 16", k.c_str(), kernarg_size);
++        // The descriptor and the metadata (what the HIP runtime packs from)
++        // must agree on the kernarg segment size.
++        for (const auto &md : md_kernarg_sizes) {
++            if (md.first == k) {
++                CHECK(md.second == (int64_t)kernarg_size,
++                      "%s: metadata .kernarg_segment_size is %lld but the .kd says %u",
++                      k.c_str(), (long long)md.second, kernarg_size);
++            }
++        }
+     }
+ }
+ 
+@@ -455,17 +750,35 @@ int main(int argc, char **argv) {
+         printf("[SKIP] Halide was built without the AMDGPU backend (WITH_AMDGPU).\n");
+         return 0;
+     }
+-    if (getenv("HL_HIP_ARCH")) {
+-        printf("[SKIP] HL_HIP_ARCH is set; it overrides the hip_gfx* features this test checks.\n");
+-        return 0;
+-    }
+-
+-    check_code_object(compile_pipeline(gfx942, Variant::Simple), "gfx942", EF_AMDGPU_MACH_AMDGCN_GFX942);
++    // Note: HL_HIP_ARCH does not affect this test. The targets below name
++    // an explicit hip_gfx* feature, which always wins over the environment
++    // variable (the e_flags checks would catch it otherwise).
++
++    // The kernel argument list OffloadGPULoops builds for the simple
++    // pipeline: the closure's buffers first (the output f, then in), then
++    // its scalars, sorted by size (all 32-bit here: f.extent.0, f.min.0,
++    // in.min.0 and the Param p). The output Func's name is uniquified per
++    // compile ("f", "f$1", ...), so only the stable names are checked.
++    // Buffers are 8-byte pointers at natural alignment, scalars follow
++    // packed at 4 bytes: 2 * 8 + 4 * 4 = 32 bytes of kernargs.
++    const ExpectedKernel simple_kernel = {
++        {
++            {"global_buffer", 0, 8, nullptr},
++            {"global_buffer", 8, 8, "in"},
++            {"by_value", 16, 4, nullptr},
++            {"by_value", 20, 4, nullptr},
++            {"by_value", 24, 4, nullptr},
++            {"by_value", 28, 4, "p"},
++        },
++        32,
++    };
++
++    check_code_object(compile_pipeline(gfx942, Variant::Simple), "gfx942", EF_AMDGPU_MACH_AMDGCN_GFX942, &simple_kernel);
+     check_code_object(compile_pipeline(gfx942, Variant::Shared), "gfx942+shared", EF_AMDGPU_MACH_AMDGCN_GFX942);
+     check_code_object(compile_pipeline(gfx942, Variant::Atomic), "gfx942+atomic", EF_AMDGPU_MACH_AMDGCN_GFX942);
+ 
+     Target gfx1100("host-hip-hip_gfx1100");
+-    check_code_object(compile_pipeline(gfx1100, Variant::Simple), "gfx1100", EF_AMDGPU_MACH_AMDGCN_GFX1100);
++    check_code_object(compile_pipeline(gfx1100, Variant::Simple), "gfx1100", EF_AMDGPU_MACH_AMDGCN_GFX1100, &simple_kernel);
+ 
+     if (failures) {
+         printf("%d check(s) failed\n", failures);
+-- 
+2.43.0
+

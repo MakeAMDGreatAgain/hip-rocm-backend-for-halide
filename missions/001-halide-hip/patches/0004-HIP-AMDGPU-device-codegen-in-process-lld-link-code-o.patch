@@ -1,0 +1,1580 @@
+From 30d932004e88f2d09a2ce1d70782a20fc1849440 Mon Sep 17 00:00:00 2001
+From: Oussama Benjelloun <benje.oussama@gmail.com>
+Date: Fri, 4 Sep 2026 14:25:02 +0200
+Subject: [PATCH 4/7] HIP: AMDGPU device codegen, in-process lld link,
+ code-object test
+
+CodeGen_AMDGPU_Dev lowers Halide GPU kernels to amdgcn-amd-amdhsa
+(amdgpu_kernel CC, addrspace(1) buffers, dynamic-LDS shared memory,
+fenced s_barrier, FP atomics metadata, COV5 by default), emits an object
+and links it in-process with lld into an HSA code object (external ld.lld
+fallback via HL_HIP_USE_EXTERNAL_LLD). correctness_hip_code_object
+validates the produced ELF without hardware.
+
+Co-authored-by: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/CodeGen_AMDGPU_Dev.cpp           | 1024 ++++++++++++++++++++++++++
+ src/CodeGen_AMDGPU_Dev.h             |   23 +
+ test/correctness/CMakeLists.txt      |    1 +
+ test/correctness/hip_code_object.cpp |  476 ++++++++++++
+ 4 files changed, 1524 insertions(+)
+ create mode 100644 src/CodeGen_AMDGPU_Dev.cpp
+ create mode 100644 src/CodeGen_AMDGPU_Dev.h
+ create mode 100644 test/correctness/hip_code_object.cpp
+
+diff --git a/src/CodeGen_AMDGPU_Dev.cpp b/src/CodeGen_AMDGPU_Dev.cpp
+new file mode 100644
+index 0000000..812e674
+--- /dev/null
++++ b/src/CodeGen_AMDGPU_Dev.cpp
+@@ -0,0 +1,1024 @@
++#include "CodeGen_AMDGPU_Dev.h"
++#include "CanonicalizeGPUVars.h"
++#include "CodeGen_GPU_Dev.h"
++#include "CodeGen_Internal.h"
++#include "CodeGen_LLVM.h"
++#include "Debug.h"
++#include "IROperator.h"
++#include "IRPrinter.h"
++#include "IRVisitor.h"
++#include "LLVM_Headers.h"
++#include "LLVM_Runtime_Linker.h"
++#include "Simplify.h"
++#include "Target.h"
++#include "Util.h"
++
++#include <algorithm>
++#include <cctype>
++#include <csignal>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++
++#ifdef WITH_AMDGPU
++// Pull in lld's ELF driver so we can link the code object in-process. This
++// declares lld::elf::link, so it has to sit at global scope.
++LLD_HAS_DRIVER(elf)
++#endif
++
++namespace Halide {
++namespace Internal {
++
++using std::string;
++using std::vector;
++
++using namespace llvm;
++
++#ifdef WITH_AMDGPU
++
++namespace {
++
++// Everything a "gfxNNN[:xnack-][:sramecc+]" target-id string breaks down into.
++// The LLVM -mcpu is the part before the first ':'; each ':feature[+-]' suffix
++// becomes a '+feature' / '-feature' entry for -mattr.
++struct HipArch {
++    string mcpu;
++    vector<string> features;
++};
++
++HipArch parse_hip_arch(const string &s) {
++    HipArch arch;
++    size_t pos = s.find(':');
++    arch.mcpu = s.substr(0, pos);
++    while (pos != string::npos) {
++        size_t next = s.find(':', pos + 1);
++        string f = s.substr(pos + 1, next == string::npos ? string::npos : next - pos - 1);
++        if (!f.empty()) {
++            char sign = f.back();
++            if (sign == '+' || sign == '-') {
++                f.pop_back();
++                arch.features.push_back(string(1, sign) + f);
++            } else {
++                arch.features.push_back("+" + f);
++            }
++        }
++        pos = next;
++    }
++    return arch;
++}
++
++// The GFX generation of an -mcpu string: gfx90a/gfx942/gfx950 -> 9,
++// gfx1030 -> 10, gfx1100/gfx1151 -> 11, gfx1201 -> 12, and likewise for the
++// "gfx9-generic" / "gfx10-3-generic" / "gfx11-generic" family names.
++// Returns 0 for anything it can't parse.
++int gfx_generation(const string &mcpu) {
++    if (!starts_with(mcpu, "gfx")) {
++        return 0;
++    }
++    string token;
++    for (size_t i = 3; i < mcpu.size() && std::isalnum((unsigned char)mcpu[i]); i++) {
++        token += mcpu[i];
++    }
++    string digits;
++    for (char c : token) {
++        if (!std::isdigit((unsigned char)c)) {
++            break;
++        }
++        digits += c;
++    }
++    if (digits.empty()) {
++        return 0;
++    }
++    if (token.size() >= 4) {
++        // gfx1030, gfx1100, ...: the first two digits are the generation.
++        return std::stoi(digits.substr(0, 2));
++    } else if (token.size() == 3) {
++        // gfx900, gfx90a, gfx942, ...: the first digit is the generation.
++        return digits[0] - '0';
++    } else {
++        // gfx9-generic, gfx10-3-generic, ...: the whole token is the generation.
++        return std::stoi(digits);
++    }
++}
++
++// The amdgcn address spaces we care about. (AMDGPUAddrSpace.h is a
++// target-internal header, so spell the numbers out; they are ABI.) Flat is
++// address space 0, i.e. CodeGen_LLVM's ptr_t.
++constexpr unsigned kAddrSpaceGlobal = 1;
++constexpr unsigned kAddrSpaceLocal = 3;
++
++// The name of the zero-length external LDS array that every shared-memory
++// allocation in a kernel is addressed through (the "dynamic LDS" idiom clang
++// uses for `extern __shared__`). The AMDGPU LDS-lowering pass places it just
++// after any static LDS, and hipModuleLaunchKernel's sharedMemBytes sizes it,
++// so the kernel descriptor's group_segment_fixed_size stays 0.
++const char *const kDynamicLDSName = "__halide_dynamic_lds";
++
++/** A code generator that emits AMDGPU code objects (HIP) from a given Halide stmt. */
++class CodeGen_AMDGPU_Dev : public CodeGen_LLVM, public CodeGen_GPU_Dev {
++public:
++    /** Create an AMDGPU device code generator. */
++    CodeGen_AMDGPU_Dev(const Target &host);
++    ~CodeGen_AMDGPU_Dev() override;
++
++    void add_kernel(Stmt stmt,
++                    const std::string &name,
++                    const std::vector<DeviceArgument> &args) override;
++
++    std::vector<char> compile_to_src() override;
++    std::string get_current_kernel_name() override;
++
++    void dump() override;
++
++    std::string print_gpu_name(const std::string &name) override;
++
++    std::string api_unique_name() override {
++        return "hip";
++    }
++
++protected:
++    using CodeGen_LLVM::visit;
++
++    /** (Re)initialize the AMDGPU module. This is separate from compile, since
++     * a device module will often have many kernels compiled into it for
++     * a single pipeline. */
++    /* override */ void init_module() override;
++
++    /** We hold onto the basic block at the start of the device
++     * function in order to inject allocas */
++    llvm::BasicBlock *entry_block;
++
++    /** Nodes for which we need to override default behavior for the GPU runtime */
++    // @{
++    void visit(const Call *) override;
++    void visit(const For *) override;
++    void visit(const Allocate *) override;
++    void visit(const Free *) override;
++    void visit(const AssertStmt *) override;
++    void visit(const Store *) override;
++    void visit(const Atomic *) override;
++    // @}
++
++    std::string mcpu_target() const override;
++    std::string mcpu_tune() const override;
++    std::string mattrs() const override;
++    bool use_soft_float_abi() const override;
++    int native_vector_bits() const override;
++    bool promote_indices() const override {
++        return false;
++    }
++
++    Type upgrade_type_for_arithmetic(const Type &t) const override {
++        return t;
++    }
++    Type upgrade_type_for_storage(const Type &t) const override;
++
++    /** Map from simt variable names (e.g. foo.block_id_x) to the llvm amdgcn
++     * intrinsic functions to call to get them. */
++    std::string simt_intrinsic(const std::string &name);
++
++    /** The target-id ("gfx942", "gfx1100:xnack-", ...) this module is being
++     * compiled for. HL_HIP_ARCH wins over the hip_gfx* target feature. */
++    HipArch hip_arch() const;
++
++    /** Build the TargetMachine for this module. Its data layout is the one
++     * source of truth for the module's layout. */
++    std::unique_ptr<llvm::TargetMachine> make_target_machine() const;
++
++    /** Created in init_module(), reused by compile_to_src(). */
++    std::unique_ptr<llvm::TargetMachine> target_machine;
++
++    /** The zero-length external LDS array shared-memory allocations are
++     * addressed through. Created lazily, once per module, by
++     * get_dynamic_lds(). */
++    llvm::GlobalVariable *dynamic_lds = nullptr;
++    llvm::GlobalVariable *get_dynamic_lds();
++
++    /** The kernels added to the current module, in order. Only used to name
++     * the files HL_HIP_DUMP_OBJ writes. */
++    std::vector<std::string> kernel_names;
++
++    /** Tag every atomicrmw / cmpxchg in a kernel with the metadata the AMDGPU
++     * backend needs before it will select hardware atomics. */
++    void annotate_atomics(llvm::Function &fn);
++
++    /** Link an ET_REL object emitted by the backend into the ET_DYN code
++     * object (.hsaco) the HIP runtime loads. */
++    std::vector<char> link_code_object(const std::vector<char> &object);
++
++    bool supports_atomic_add(const Type &t) const override;
++};
++
++CodeGen_AMDGPU_Dev::CodeGen_AMDGPU_Dev(const Target &host)
++    : CodeGen_LLVM(host) {
++    context = new llvm::LLVMContext();
++}
++
++CodeGen_AMDGPU_Dev::~CodeGen_AMDGPU_Dev() {
++    // This is required as destroying the context before the module
++    // results in a crash. Really, responsibility for destruction
++    // should be entirely in the parent class.
++    // TODO: Figure out how to better manage the context -- e.g. allow using
++    // same one as the host.
++    target_machine.reset();
++    module.reset();
++    delete context;
++}
++
++Type CodeGen_AMDGPU_Dev::upgrade_type_for_storage(const Type &t) const {
++    if (t.element_of() == Float(16)) {
++        return t;
++    }
++    return CodeGen_LLVM::upgrade_type_for_storage(t);
++}
++
++// The largest extent of each of the GPU thread loops, if they are all
++// constant. A kernel may contain several thread loops in sequence, so take the
++// largest of each.
++class BlockSize : public IRVisitor {
++    using IRVisitor::visit;
++
++    void visit(const For *op) override {
++        for (int i = 0; i < 3; i++) {
++            if (ends_with(op->name, gpu_thread_name(i))) {
++                if (auto e = as_const_int(simplify(op->extent()))) {
++                    extent[i] = std::max(extent[i], (int)*e);
++                } else {
++                    known = false;
++                }
++            }
++        }
++        IRVisitor::visit(op);
++    }
++
++public:
++    int extent[3] = {1, 1, 1};
++    bool known = true;
++};
++
++void CodeGen_AMDGPU_Dev::add_kernel(Stmt stmt,
++                                    const std::string &name,
++                                    const std::vector<DeviceArgument> &args) {
++    internal_assert(module != nullptr);
++
++    debug(2) << "In CodeGen_AMDGPU_Dev::add_kernel\n";
++
++    // Now deduce the types of the arguments to our function. Buffers arrive
++    // as global-memory pointers; scalars are passed by value.
++    llvm::PointerType *global_ptr_t = PointerType::get(*context, kAddrSpaceGlobal);
++    vector<llvm::Type *> arg_types(args.size());
++    for (size_t i = 0; i < args.size(); i++) {
++        if (args[i].is_buffer) {
++            arg_types[i] = global_ptr_t;
++        } else {
++            arg_types[i] = llvm_type_of(args[i].type);
++        }
++    }
++
++    // Make our function
++    FunctionType *func_t = FunctionType::get(void_t, arg_types, false);
++    function = llvm::Function::Create(func_t, llvm::Function::ExternalLinkage, name, module.get());
++    set_function_attributes_from_halide_target_options(*function);
++
++    // Mark the buffer args as no alias
++    for (size_t i = 0; i < args.size(); i++) {
++        if (args[i].is_buffer) {
++            function->addParamAttr(i, Attribute::NoAlias);
++        }
++    }
++
++    // The calling convention is what makes this a kernel (there is no
++    // nvvm.annotations-style metadata on AMDGPU).
++    function->setCallingConv(llvm::CallingConv::AMDGPU_KERNEL);
++
++    // Make the initial basic block
++    entry_block = BasicBlock::Create(*context, "entry", function);
++    builder->SetInsertPoint(entry_block);
++
++    // Put the arguments in the symbol table. The inherited CodeGen_LLVM
++    // code assumes flat (address space 0) pointers, so buffer arguments are
++    // cast to flat right here and the flat pointer is what the symbol table
++    // holds. The AMDGPU pipeline's InferAddressSpaces pass folds the casts
++    // back through the GEPs so loads and stores still become global_load /
++    // global_store rather than flat_load / flat_store.
++    vector<string> arg_sym_names;
++    {
++        size_t i = 0;
++        for (auto &fn_arg : function->args()) {
++            string arg_sym_name = args[i].name;
++            fn_arg.setName(arg_sym_name);
++            Value *sym_value = &fn_arg;
++            if (args[i].is_buffer) {
++                sym_value = builder->CreateAddrSpaceCast(&fn_arg, ptr_t, arg_sym_name + ".flat");
++            }
++            sym_push(arg_sym_name, sym_value);
++            arg_sym_names.push_back(arg_sym_name);
++            i++;
++        }
++    }
++
++    // We won't end the entry block yet, because we'll want to add
++    // some allocas to it later if there are local allocations. Start
++    // a new block to put all the code.
++    BasicBlock *body_block = BasicBlock::Create(*context, "body", function);
++    builder->SetInsertPoint(body_block);
++
++    debug(1) << "Generating llvm bitcode for kernel...\n";
++    // Ok, we have a module, function, context, and a builder
++    // pointing at a brand new basic block. We're good to go.
++    stmt.accept(this);
++
++    // Now we need to end the function
++    builder->CreateRetVoid();
++
++    // Make the entry block point to the body block
++    builder->SetInsertPoint(entry_block);
++    builder->CreateBr(body_block);
++
++    // Tell the backend the most work-items a work-group can have. Without
++    // this it assumes the maximum (1024) and budgets registers for it.
++    BlockSize block_size;
++    stmt.accept(&block_size);
++    int max_threads = 1024;
++    if (block_size.known) {
++        max_threads = std::min(max_threads,
++                               block_size.extent[0] * block_size.extent[1] * block_size.extent[2]);
++        debug(2) << "Kernel " << name << " has block size "
++                 << block_size.extent[0] << "x" << block_size.extent[1]
++                 << "x" << block_size.extent[2] << "\n";
++    }
++    function->addFnAttr("amdgpu-flat-work-group-size", "1," + std::to_string(max_threads));
++    // Halide always launches whole work-groups of the size it computed.
++    function->addFnAttr("uniform-work-group-size", "true");
++
++    annotate_atomics(*function);
++
++    // Now verify the function is ok. Unlike the PTX backend, fail loudly
++    // here: the address-space handling above is new enough that a broken
++    // kernel should be caught next to the code that produced it rather than
++    // by the module verifier after optimization.
++    internal_assert(!verifyFunction(*function, &errs()))
++        << "AMDGPU kernel " << name << " failed LLVM verification (see above)\n";
++
++    // Finally, verify the module is ok
++    internal_assert(!verifyModule(*module, &errs()))
++        << "AMDGPU module failed LLVM verification after adding kernel " << name << "\n";
++
++    kernel_names.push_back(name);
++
++    debug(2) << "Done generating llvm bitcode for AMDGPU\n";
++
++    // Clear the symbol table
++    for (const auto &arg_sym_name : arg_sym_names) {
++        sym_pop(arg_sym_name);
++    }
++}
++
++void CodeGen_AMDGPU_Dev::annotate_atomics(llvm::Function &fn) {
++    // Since LLVM 19 the AMDGPU backend only selects hardware read-modify-write
++    // atomics (notably the FP ones: global_atomic_add_f32 and friends) when
++    // the instruction promises that the memory is neither fine-grained nor
++    // remote; otherwise it expands to a CAS loop. Halide's device buffers are
++    // hipMalloc'd, i.e. coarse-grained device-local memory, so both promises
++    // hold. There is no hook in CodeGen_LLVM where the atomicrmw is created,
++    // so tag them after the fact.
++    MDNode *empty = MDNode::get(*context, {});
++    for (BasicBlock &bb : fn) {
++        for (Instruction &inst : bb) {
++            if (isa<AtomicRMWInst>(inst) || isa<AtomicCmpXchgInst>(inst)) {
++                inst.setMetadata("amdgpu.no.fine.grained.memory", empty);
++                inst.setMetadata("amdgpu.no.remote.memory", empty);
++            }
++        }
++    }
++}
++
++llvm::GlobalVariable *CodeGen_AMDGPU_Dev::get_dynamic_lds() {
++    if (!dynamic_lds) {
++        dynamic_lds = module->getGlobalVariable(kDynamicLDSName, /*AllowInternal=*/true);
++    }
++    if (!dynamic_lds) {
++        // @__halide_dynamic_lds = external addrspace(3) global [0 x i8], align 16
++        llvm::Type *array_t = ArrayType::get(i8_t, 0);
++        dynamic_lds = new GlobalVariable(*module, array_t, /*isConstant=*/false,
++                                         GlobalValue::ExternalLinkage, /*Initializer=*/nullptr,
++                                         kDynamicLDSName, /*InsertBefore=*/nullptr,
++                                         GlobalValue::NotThreadLocal, kAddrSpaceLocal,
++                                         /*isExternallyInitialized=*/false);
++        dynamic_lds->setAlignment(Align(16));
++    }
++    return dynamic_lds;
++}
++
++void CodeGen_AMDGPU_Dev::init_module() {
++    // This class uses multiple inheritance. It's a GPU device code generator,
++    // and also an llvm-based one. Both of these track strict_float presence,
++    // but OffloadGPULoops only sets the GPU device code generator flag, so here
++    // we set the CodeGen_LLVM flag to match.
++    CodeGen_LLVM::any_strict_float = CodeGen_GPU_Dev::any_strict_float;
++
++    init_context();
++
++    module = get_initial_module_for_amdgpu_device(target, context);
++    dynamic_lds = nullptr;
++    kernel_names.clear();
++
++    // The data layout comes from the TargetMachine, never from a string
++    // literal, so it cannot drift from the LLVM in use.
++    target_machine = make_target_machine();
++    module->setDataLayout(target_machine->createDataLayout());
++
++    // set_function_attributes_from_halide_target_options() reads these to
++    // stamp target-cpu / target-features on every kernel. Without them the
++    // attributes would be empty strings, and the AMDGPU backend treats an
++    // empty target-cpu as "generic" rather than falling back to the
++    // TargetMachine's CPU, which would produce the wrong ISA.
++    module->addModuleFlag(llvm::Module::Warning, "halide_mcpu_target", MDString::get(*context, mcpu_target()));
++    module->addModuleFlag(llvm::Module::Warning, "halide_mcpu_tune", MDString::get(*context, mcpu_tune()));
++    module->addModuleFlag(llvm::Module::Warning, "halide_mattrs", MDString::get(*context, mattrs()));
++
++    // Code object version. COV5 is what ROCm 5.x through 7.x runtimes accept;
++    // COV6 is opt-in (and required for the *-generic targets). The flag holds
++    // the version times 100. This must be set before any passes run.
++    int code_object_version = 5;
++    string cov_env = get_env_variable("HL_HIP_CODE_OBJECT_VERSION");
++    if (!cov_env.empty()) {
++        code_object_version = std::atoi(cov_env.c_str());
++        user_assert(code_object_version == 4 || code_object_version == 5 || code_object_version == 6)
++            << "HL_HIP_CODE_OBJECT_VERSION must be 4, 5 or 6, got " << cov_env << "\n";
++    }
++    module->addModuleFlag(llvm::Module::Error, "amdhsa_code_object_version", code_object_version * 100);
++
++    struct Intrinsic {
++        const char *name;
++        Type ret_type;
++        const char *intrin_name;
++        vector<Type> arg_types;
++    };
++
++    // TODO(T7): dot-product intrinsics (llvm.amdgcn.sdot4/udot4 on gfx908+)
++    // go here, mirroring the dp4a/dp2a table in CodeGen_PTX_Dev.
++    Intrinsic amdgpu_intrins[] = {
++        {"round", Float(32), "llvm.rint.f32", {Float(32)}},
++        {"round", Float(64), "llvm.rint.f64", {Float(64)}},
++    };
++
++    for (auto &&i : amdgpu_intrins) {
++        auto *fn = declare_intrin_overload(i.name, i.ret_type, i.intrin_name, std::move(i.arg_types));
++        function_does_not_access_memory(fn);
++        fn->addFnAttr(llvm::Attribute::NoUnwind);
++    }
++
++    if (CodeGen_GPU_Dev::any_strict_float) {
++        set_strict_fp_math();
++        in_strict_float = target.has_feature(Target::StrictFloat);
++    } else {
++        set_fast_fp_math();
++    }
++}
++
++void CodeGen_AMDGPU_Dev::visit(const Call *op) {
++    if (op->is_intrinsic(Call::gpu_thread_barrier)) {
++        internal_assert(op->args.size() == 1) << "gpu_thread_barrier() intrinsic must specify memory fence type.\n";
++
++        auto fence_type_ptr = as_const_int(op->args[0]);
++        internal_assert(fence_type_ptr) << "gpu_thread_barrier() parameter is not a constant integer.\n";
++
++        // s_barrier on its own is only an execution barrier; the memory
++        // ordering comes from the fences around it. Shared (LDS) traffic
++        // needs workgroup scope, global memory needs agent scope. A fence
++        // type of None still gets the workgroup-scope fences: they are
++        // cheap, and the PTX backend's barrier is a full CTA fence too.
++        const char *scope = (*fence_type_ptr & CodeGen_GPU_Dev::MemoryFenceType::Device) ? "agent" : "workgroup";
++        llvm::SyncScope::ID scope_id = context->getOrInsertSyncScopeID(scope);
++
++        llvm::Intrinsic::ID id = llvm::Intrinsic::lookupIntrinsicID("llvm.amdgcn.s.barrier");
++        internal_assert(id != llvm::Intrinsic::not_intrinsic)
++            << "Could not find AMDGPU barrier intrinsic llvm.amdgcn.s.barrier\n";
++        llvm::Function *barrier = llvm::Intrinsic::getOrInsertDeclaration(module.get(), id);
++
++        builder->CreateFence(llvm::AtomicOrdering::Release, scope_id);
++        builder->CreateCall(barrier);
++        builder->CreateFence(llvm::AtomicOrdering::Acquire, scope_id);
++
++        value = ConstantInt::get(i32_t, 0);
++        return;
++    }
++
++    if (op->is_intrinsic(Call::cuda_await_copies) ||
++        op->is_intrinsic(Call::cuda_bypass_registers)) {
++        // These implement MemoryType::GPUSharedAsync with cp.async, which has
++        // no AMDGPU counterpart yet. FuseGPUThreadLoops only emits them when
++        // the device API is CUDA (and demotes GPUSharedAsync to GPUShared
++        // everywhere else), so reaching here is a lowering bug, not a user
++        // error.
++        internal_error << "CodeGen_AMDGPU_Dev: " << op->name
++                       << " is a CUDA-only intrinsic (asynchronous shared-memory "
++                       << "copies are not supported on HIP)\n";
++    }
++
++    // TODO: It would be better if CodeGen_LLVM could handle overloaded intrin calls by default.
++    value = call_overloaded_intrin(op->type, op->name, op->args);
++    if (!value) {
++        CodeGen_LLVM::visit(op);
++    }
++}
++
++string CodeGen_AMDGPU_Dev::simt_intrinsic(const string &name) {
++    if (ends_with(name, gpu_thread_name(0))) {
++        return "llvm.amdgcn.workitem.id.x";
++    } else if (ends_with(name, gpu_thread_name(1))) {
++        return "llvm.amdgcn.workitem.id.y";
++    } else if (ends_with(name, gpu_thread_name(2))) {
++        return "llvm.amdgcn.workitem.id.z";
++    } else if (ends_with(name, gpu_block_name(0))) {
++        return "llvm.amdgcn.workgroup.id.x";
++    } else if (ends_with(name, gpu_block_name(1))) {
++        return "llvm.amdgcn.workgroup.id.y";
++    } else if (ends_with(name, gpu_block_name(2))) {
++        return "llvm.amdgcn.workgroup.id.z";
++    }
++    internal_error << "simt_intrinsic called on bad variable name\n";
++    return "";
++}
++
++void CodeGen_AMDGPU_Dev::visit(const For *loop) {
++    if (is_gpu(loop->for_type)) {
++        Expr simt_idx = Call::make(Int(32), simt_intrinsic(loop->name), std::vector<Expr>(), Call::Extern);
++        internal_assert(is_const_zero(loop->min));
++        sym_push(loop->name, codegen(simt_idx));
++        codegen(loop->body);
++        sym_pop(loop->name);
++    } else {
++        CodeGen_LLVM::visit(loop);
++    }
++}
++
++void CodeGen_AMDGPU_Dev::visit(const Allocate *alloc) {
++    user_assert(!alloc->new_expr.defined()) << "Allocate node inside AMDGPU kernel has custom new expression.\n"
++                                            << "(Memoization is not supported inside GPU kernels at present.)\n";
++    if (is_gpu_shared(alloc->memory_type)) {
++        // Every shared allocation in a kernel is addressed through the one
++        // dynamic-LDS array: FuseGPUThreadLoops has already folded all of
++        // them into offsets of a single allocation whose size the host
++        // passes as sharedMemBytes at launch. Never use a null pointer in
++        // address space 3 as the base: on AMDGPU LDS null is 0xFFFFFFFF.
++        //
++        // The symbol keeps its LDS (address space 3) pointer type. The
++        // inherited CodeGen_LLVM load/store code only ever GEPs from the
++        // symbol value (codegen_buffer_pointer), and GEPs preserve the
++        // address space, so accesses lower straight to ds_read / ds_write
++        // without a round trip through flat pointers.
++        sym_push(alloc->name, get_dynamic_lds());
++    } else {
++        debug(2) << "Allocate " << alloc->name << " on device\n";
++
++        string allocation_name = alloc->name;
++        debug(3) << "Pushing allocation called " << allocation_name << " onto the symbol table\n";
++
++        // Jump back to the entry and generate an alloca. Note that by
++        // jumping back we're rendering any expression we carry back
++        // meaningless, so we had better only be dealing with
++        // constants here.
++        int32_t size = alloc->constant_allocation_size();
++        internal_assert(size > 0)
++            << "Allocation " << alloc->name << " has a dynamic size. "
++            << "This should have been moved to the heap by the "
++            << "fuse_gpu_thread_loops lowering pass.\n";
++
++        BasicBlock *here = builder->GetInsertBlock();
++
++        builder->SetInsertPoint(entry_block);
++        // The amdgcn data layout puts allocas in the private address space
++        // (5); IRBuilder picks that up from the module. Cast to a flat
++        // pointer for the symbol table so inherited CodeGen_LLVM code that
++        // assumes address space 0 keeps working; InferAddressSpaces folds
++        // the cast back into scratch accesses.
++        AllocaInst *alloca = builder->CreateAlloca(llvm_type_of(alloc->type), ConstantInt::get(i32_t, size),
++                                                   allocation_name + ".private");
++        internal_assert(alloca->getAddressSpace() == module->getDataLayout().getAllocaAddrSpace());
++        Value *ptr = builder->CreateAddrSpaceCast(alloca, ptr_t, allocation_name);
++        builder->SetInsertPoint(here);
++        sym_push(allocation_name, ptr);
++    }
++    codegen(alloc->body);
++}
++
++void CodeGen_AMDGPU_Dev::visit(const Free *f) {
++    sym_pop(f->name);
++}
++
++void CodeGen_AMDGPU_Dev::visit(const AssertStmt *op) {
++    // Discard the error message for now. halide_amdgpu_trap (amdgpu_dev.ll)
++    // is llvm.trap, i.e. s_trap 2: the wave is killed and the runtime sees
++    // the dispatch fail on the next synchronization.
++    Expr trap = Call::make(Int(32), "halide_amdgpu_trap", {}, Call::Extern);
++    codegen(IfThenElse::make(!op->condition, Evaluate::make(trap)));
++}
++
++void CodeGen_AMDGPU_Dev::visit(const Store *op) {
++    // Issue atomic store if we are inside an Atomic node.
++    if (emit_atomic_stores) {
++        user_assert(is_const_one(op->predicate)) << "Atomic update does not support predicated store.\n";
++        user_assert(op->value.type().bits() >= 32) << "HIP: 8-bit or 16-bit atomics are not supported.\n";
++    }
++
++    // Unlike the PTX backend there is no i128 rewrite of aligned 4-wide
++    // 32-bit accesses here: the AMDGPU backend selects dwordx4 loads and
++    // stores for aligned <4 x i32>/<4 x float> on its own.
++    CodeGen_LLVM::visit(op);
++}
++
++void CodeGen_AMDGPU_Dev::visit(const Atomic *op) {
++    // All the lanes of a wavefront execute in lockstep, so a mutex loop
++    // would deadlock, exactly as it does in CUDA.
++    user_assert(op->mutex_name.empty())
++        << "The atomic update requires a mutex lock, which is not supported in HIP.\n";
++
++    // Issue atomic stores. The atomicrmw / cmpxchg instructions this produces
++    // get their !amdgpu.no.fine.grained.memory metadata in annotate_atomics()
++    // once the whole kernel body has been generated.
++    ScopedValue<bool> old_emit_atomic_stores(emit_atomic_stores, true);
++    CodeGen_LLVM::visit(op);
++}
++
++HipArch CodeGen_AMDGPU_Dev::hip_arch() const {
++    // The environment variable is the long tail: any gfx name LLVM knows,
++    // optionally with target-id features, and it wins over the target string.
++    string env = get_env_variable("HL_HIP_ARCH");
++    if (!env.empty()) {
++        return parse_hip_arch(env);
++    }
++    string arch = target.get_hip_arch_string();
++    user_assert(!arch.empty())
++        << "hip target requires a hip_gfx* feature or HL_HIP_ARCH "
++        << "(e.g. HL_HIP_ARCH=gfx942) to select the GPU architecture.\n";
++    return parse_hip_arch(arch);
++}
++
++string CodeGen_AMDGPU_Dev::mcpu_target() const {
++    return hip_arch().mcpu;
++}
++
++string CodeGen_AMDGPU_Dev::mcpu_tune() const {
++    return mcpu_target();
++}
++
++string CodeGen_AMDGPU_Dev::mattrs() const {
++    HipArch arch = hip_arch();
++    vector<string> features;
++    // gfx10 and later default to wave64 in LLVM unless told otherwise, but
++    // wave32 is the native (and HIP's default) mode there. gfx9 is wave64 only.
++    if (gfx_generation(arch.mcpu) >= 10) {
++        features.emplace_back("+wavefrontsize32");
++    }
++    features.insert(features.end(), arch.features.begin(), arch.features.end());
++    string extra = get_env_variable("HL_HIP_MATTRS");
++    if (!extra.empty()) {
++        features.push_back(extra);
++    }
++    string result;
++    for (const string &f : features) {
++        if (!result.empty()) {
++            result += ",";
++        }
++        result += f;
++    }
++    return result;
++}
++
++bool CodeGen_AMDGPU_Dev::use_soft_float_abi() const {
++    return false;
++}
++
++std::unique_ptr<llvm::TargetMachine> CodeGen_AMDGPU_Dev::make_target_machine() const {
++    internal_assert(module != nullptr);
++
++    // Allocate target machine (similar to code in CodeGen_Internal.cpp make_target_machine)
++    std::string err_str;
++    auto triple = llvm::Triple(module->getTargetTriple());
++    const llvm::Target *llvm_target = TargetRegistry::lookupTarget(triple, err_str);
++    internal_assert(llvm_target) << "Could not create LLVM target for " << triple.str() << ": " << err_str << "\n";
++
++    TargetOptions options;
++    options.AllowFPOpFusion = CodeGen_GPU_Dev::any_strict_float ? llvm::FPOpFusion::Strict : llvm::FPOpFusion::Fast;
++#if LLVM_VERSION < 230
++    options.NoInfsFPMath = !CodeGen_GPU_Dev::any_strict_float;
++    options.NoNaNsFPMath = !CodeGen_GPU_Dev::any_strict_float;
++#endif
++    options.HonorSignDependentRoundingFPMathOption = !CodeGen_GPU_Dev::any_strict_float;
++    options.NoZerosInBSS = false;
++    options.GuaranteedTailCallOpt = false;
++
++    std::unique_ptr<TargetMachine>
++        tm(llvm_target->createTargetMachine(
++            triple,
++            mcpu_target(), mattrs(), options,
++            llvm::Reloc::PIC_,
++            llvm::CodeModel::Small,
++            CodeGenOptLevel::Aggressive));
++
++    internal_assert(tm.get()) << "Could not allocate target machine!";
++    return tm;
++}
++
++namespace {
++
++// Serializes every in-process lld invocation. lld keeps global state (its
++// error handler, the driver's option tables, the signal handlers it installs)
++// and is not safe to enter from two threads at once.
++std::mutex lld_mutex;
++
++// Set once an in-process link reports it cannot be run again (a fatal error
++// left lld's globals in an unknown state). From then on every link goes
++// through the external ld.lld.
++bool in_process_lld_poisoned = false;
++
++// Where HL_HIP_DUMP_OBJ writes to, or empty. The file name is
++// <first kernel>[.<n>].<ext> so repeated compiles of one pipeline don't
++// overwrite each other.
++void dump_code_object(const string &dir, const string &stem, const string &ext, const vector<char> &bytes) {
++    if (dir.empty()) {
++        return;
++    }
++    static std::mutex dump_mutex;
++    static std::map<string, int> seen;
++    string name;
++    {
++        std::lock_guard<std::mutex> lock(dump_mutex);
++        int n = seen[stem + ext]++;
++        name = stem + (n ? "." + std::to_string(n) : "") + ext;
++    }
++    string path = dir;
++    if (!path.empty() && path.back() != '/' && path.back() != '\\') {
++        path += '/';
++    }
++    path += name;
++    write_entire_file(path, bytes);
++    debug(1) << "HL_HIP_DUMP_OBJ: wrote " << bytes.size() << " bytes to " << path << "\n";
++}
++
++}  // namespace
++
++vector<char> CodeGen_AMDGPU_Dev::link_code_object(const vector<char> &object) {
++    TemporaryFile obj_file("halide_hip_", ".o");
++    TemporaryFile hsaco_file("halide_hip_", ".hsaco");
++    write_entire_file(obj_file.pathname(), object);
++
++    // This is exactly the link line clang uses for a HIP device link
++    // (minus the LTO plugin options, which don't apply to a plain object).
++    // -shared makes it ET_DYN, which is what hipModuleLoadData expects;
++    // --no-undefined turns any helper the device module failed to inline
++    // into a link error here instead of a load error on the GPU.
++    vector<string> arg_strs = {
++        "ld.lld",
++        "-flavor", "gnu",
++        "-m", "elf64_amdgpu",
++        "--no-undefined",
++        "-shared",
++        "-o", hsaco_file.pathname(),
++        obj_file.pathname()};
++
++    bool use_external = get_env_variable("HL_HIP_USE_EXTERNAL_LLD") == "1";
++    {
++        std::lock_guard<std::mutex> lock(lld_mutex);
++        if (in_process_lld_poisoned) {
++            use_external = true;
++        }
++    }
++
++    if (use_external) {
++        string lld_path = get_env_variable("HL_HIP_LLD");
++        if (lld_path.empty()) {
++            lld_path = "ld.lld";
++        }
++        arg_strs[0] = lld_path;
++        debug(1) << "Linking AMDGPU code object with external " << lld_path << "\n";
++        TemporaryFile log_file("halide_hip_lld_", ".log");
++        int rc = run_process(arg_strs, log_file.pathname(), log_file.pathname());
++        vector<char> log = read_entire_file(log_file.pathname());
++        string log_str(log.begin(), log.end());
++        if (rc == -1) {
++            user_error << "Could not run " << lld_path << " to link the HIP code object. "
++                       << "Set HL_HIP_LLD to the path of an ld.lld from the same LLVM "
++                       << "version as Halide, or unset HL_HIP_USE_EXTERNAL_LLD.\n";
++        }
++        internal_assert(rc == 0)
++            << lld_path << " failed with exit code " << rc << " while linking the HIP code object:\n"
++            << log_str;
++        if (!log_str.empty()) {
++            debug(1) << lld_path << ": " << log_str << "\n";
++        }
++    } else {
++        vector<const char *> lld_args;
++        lld_args.reserve(arg_strs.size());
++        for (const string &s : arg_strs) {
++            lld_args.push_back(s.c_str());
++        }
++
++        string lld_stdout, lld_stderr;
++        raw_string_ostream out_stream(lld_stdout);
++        raw_string_ostream err_stream(lld_stderr);
++
++        lld::Result r;
++        {
++            std::lock_guard<std::mutex> lock(lld_mutex);
++
++            // lld will temporarily hijack the signal handlers to ensure that temp
++            // files get cleaned up, but rather than preserving custom handlers in
++            // place, it restores the default handlers. This conflicts with some
++            // of our testing infrastructure, which relies on a SIGABRT handler set
++            // at global-ctor time to stay set. Therefore we'll save and restore
++            // this ourselves. (See the same dance in WasmExecutor.cpp.)
++            auto old_abort_handler = std::signal(SIGABRT, SIG_DFL);
++
++            r = lld::lldMain(lld_args, out_stream, err_stream, {{lld::Gnu, &lld::elf::link}});
++
++            std::signal(SIGABRT, old_abort_handler);
++
++            if (!r.canRunAgain) {
++                // lld hit a fatal error and its globals may be inconsistent.
++                // Never call lld::exitLld (it would kill the process); route
++                // every later link through the external linker instead.
++                in_process_lld_poisoned = true;
++            }
++        }
++        out_stream.flush();
++        err_stream.flush();
++
++        if (!lld_stdout.empty()) {
++            debug(1) << "ld.lld: " << lld_stdout << "\n";
++        }
++        internal_assert(r.retCode == 0 && r.canRunAgain)
++            << "In-process ld.lld failed to link the HIP code object (exit code " << r.retCode
++            << (r.canRunAgain ? "" : ", fatal") << "):\n"
++            << lld_stderr
++            << "Set HL_HIP_USE_EXTERNAL_LLD=1 (and HL_HIP_LLD=/path/to/ld.lld) to link "
++            << "with an external ld.lld instead.\n";
++        if (!lld_stderr.empty()) {
++            debug(1) << "ld.lld: " << lld_stderr << "\n";
++        }
++    }
++
++    return read_entire_file(hsaco_file.pathname());
++}
++
++vector<char> CodeGen_AMDGPU_Dev::compile_to_src() {
++    debug(2) << "In CodeGen_AMDGPU_Dev::compile_to_src";
++
++    internal_assert(module != nullptr);
++    if (!target_machine) {
++        target_machine = make_target_machine();
++    }
++    module->setDataLayout(target_machine->createDataLayout());
++
++    // Set up passes
++    llvm::SmallString<8> outstr;
++    raw_svector_ostream ostream(outstr);
++    ostream.SetUnbuffered();
++
++    // Denormal handling. Flushing f32 denormals to zero is the fast (and
++    // HIP's default) mode; strict float keeps them.
++    const char *denormal_mode = CodeGen_GPU_Dev::any_strict_float ? "ieee,ieee" : "preserve-sign,preserve-sign";
++    for (llvm::Function &fn : *module) {
++        if (!fn.isDeclaration()) {
++            fn.addFnAttr("denormal-fp-math-f32", denormal_mode);
++        }
++    }
++
++    const bool do_loop_opt = get_target().has_feature(Target::EnableLLVMLoopOpt);
++
++    // Define and run optimization pipeline with new pass manager
++    PipelineTuningOptions pto;
++    pto.LoopInterleaving = do_loop_opt;
++    pto.LoopVectorization = do_loop_opt;
++    pto.SLPVectorization = true;  // Note: SLP vectorization has no analogue in the Halide scheduling model
++    pto.LoopUnrolling = do_loop_opt;
++    pto.ForgetAllSCEVInLoopUnroll = true;
++
++    llvm::PassBuilder pb(target_machine.get(), pto);
++
++    // These analysis managers have to be declared in this order.
++    llvm::LoopAnalysisManager lam;
++    llvm::FunctionAnalysisManager fam;
++    llvm::CGSCCAnalysisManager cgam;
++    llvm::ModuleAnalysisManager mam;
++
++    // Register all the basic analyses with the managers.
++    pb.registerModuleAnalyses(mam);
++    pb.registerCGSCCAnalyses(cgam);
++    pb.registerFunctionAnalyses(fam);
++    pb.registerLoopAnalyses(lam);
++    pb.crossRegisterProxies(lam, fam, cgam, mam);
++    ModulePassManager mpm;
++
++    using OptimizationLevel = llvm::OptimizationLevel;
++    OptimizationLevel level = OptimizationLevel::O3;
++
++    // This is what adds the AMDGPU-specific passes (address space inference,
++    // LDS lowering, attributor, ...) to the default pipeline.
++    target_machine->registerPassBuilderCallbacks(pb);
++
++    mpm = pb.buildPerModuleDefaultPipeline(level);
++    mpm.run(*module, mam);
++
++    if (llvm::verifyModule(*module, &errs())) {
++        report_fatal_error("Transformation resulted in an invalid module\n");
++    }
++
++    // Optimization pipeline completed; run codegen pipeline
++
++    // NOTE: use of the "legacy" PassManager here is still required; it is deprecated
++    // for optimization, but is still the only complete API for codegen. See the
++    // matching comment in CodeGen_PTX_Dev::compile_to_src.
++    legacy::PassManager module_pass_manager;
++    module_pass_manager.add(createTargetTransformInfoWrapperPass(target_machine->getTargetIRAnalysis()));
++
++    // Ask the target to add backend passes as necessary. Unlike PTX (which is
++    // text), an AMDGPU code object is a relocatable ELF that still has to be
++    // linked before the HIP runtime can load it.
++    bool fail = target_machine->addPassesToEmitFile(module_pass_manager, ostream, nullptr,
++                                                    CodeGenFileType::ObjectFile, true);
++    internal_assert(!fail) << "Failed to set up passes to emit AMDGPU code object\n";
++    module_pass_manager.run(*module);
++
++    // Codegen pipeline completed.
++    debug(2) << [&] {
++        dump();
++        return "Done with CodeGen_AMDGPU_Dev::compile_to_src";
++    }();
++
++    debug(1) << "AMDGPU code object: " << outstr.size() << " bytes (ET_REL, unlinked)\n";
++
++    vector<char> object(outstr.begin(), outstr.end());
++
++    const string dump_dir = get_env_variable("HL_HIP_DUMP_OBJ");
++    const string dump_stem = kernel_names.empty() ? string("halide_hip_module") : kernel_names.front();
++    dump_code_object(dump_dir, dump_stem, ".o", object);
++
++    // hipModuleLoadData needs an ET_DYN code object, so link. Unlike PTX
++    // the result is binary: no trailing NUL. OffloadGPULoops embeds exactly
++    // these bytes and passes their count to halide_hip_initialize_kernels.
++    vector<char> hsaco = link_code_object(object);
++    debug(1) << "AMDGPU code object: " << hsaco.size() << " bytes (ET_DYN, linked)\n";
++
++    dump_code_object(dump_dir, dump_stem, ".hsaco", hsaco);
++
++    return hsaco;
++}
++
++int CodeGen_AMDGPU_Dev::native_vector_bits() const {
++    // dwordx4: the widest single global/LDS access is 128 bits.
++    return 128;
++}
++
++string CodeGen_AMDGPU_Dev::get_current_kernel_name() {
++    return get_llvm_function_name(function);
++}
++
++void CodeGen_AMDGPU_Dev::dump() {
++    module->print(dbgs(), nullptr, false, true);
++}
++
++std::string CodeGen_AMDGPU_Dev::print_gpu_name(const std::string &name) {
++    return name;
++}
++
++bool CodeGen_AMDGPU_Dev::supports_atomic_add(const Type &t) const {
++    if (t.bits() < 32) {
++        // TODO(T7): packed f16/bf16 atomics exist on gfx90a+.
++        return false;
++    }
++    if (t.is_int_or_uint()) {
++        return true;
++    }
++    if (t.is_float() && t.bits() == 32) {
++        // Hardware on gfx908+, CAS loop elsewhere; either way LLVM lowers it.
++        return true;
++    }
++    if (t.is_float() && t.bits() == 64) {
++        // Hardware f64 atomics are a CDNA (gfx90a/gfx942/gfx950) feature.
++        // TODO(T7): refine per-arch; CAS fallback would make this always true.
++        const string mcpu = mcpu_target();
++        return mcpu == "gfx90a" || starts_with(mcpu, "gfx94") || starts_with(mcpu, "gfx95");
++    }
++    return false;
++}
++
++}  // namespace
++
++std::unique_ptr<CodeGen_GPU_Dev> new_CodeGen_AMDGPU_Dev(const Target &target) {
++    return std::make_unique<CodeGen_AMDGPU_Dev>(target);
++}
++
++#else  // WITH_AMDGPU
++
++std::unique_ptr<CodeGen_GPU_Dev> new_CodeGen_AMDGPU_Dev(const Target &target) {
++    user_error << "AMDGPU/HIP not enabled for this build of Halide.\n";
++    return nullptr;
++}
++
++#endif  // WITH_AMDGPU
++
++}  // namespace Internal
++}  // namespace Halide
+diff --git a/src/CodeGen_AMDGPU_Dev.h b/src/CodeGen_AMDGPU_Dev.h
+new file mode 100644
+index 0000000..f850e9d
+--- /dev/null
++++ b/src/CodeGen_AMDGPU_Dev.h
+@@ -0,0 +1,23 @@
++#ifndef HALIDE_CODEGEN_AMDGPU_DEV_H
++#define HALIDE_CODEGEN_AMDGPU_DEV_H
++
++/** \file
++ * Defines the code-generator for producing AMDGPU (HIP) device code
++ */
++
++#include <memory>
++
++namespace Halide {
++
++struct Target;
++
++namespace Internal {
++
++struct CodeGen_GPU_Dev;
++
++std::unique_ptr<CodeGen_GPU_Dev> new_CodeGen_AMDGPU_Dev(const Target &target);
++
++}  // namespace Internal
++}  // namespace Halide
++
++#endif
+diff --git a/test/correctness/CMakeLists.txt b/test/correctness/CMakeLists.txt
+index d88c13f..4e6a1b4 100644
+--- a/test/correctness/CMakeLists.txt
++++ b/test/correctness/CMakeLists.txt
+@@ -194,6 +194,7 @@ tests(
+     heap_cleanup.cpp
+     hello_gpu.cpp
+     hexagon_scatter.cpp
++    hip_code_object.cpp
+     histogram.cpp
+     histogram_equalize.cpp
+     hoist_loop_invariant_if_statements.cpp
+diff --git a/test/correctness/hip_code_object.cpp b/test/correctness/hip_code_object.cpp
+new file mode 100644
+index 0000000..0471662
+--- /dev/null
++++ b/test/correctness/hip_code_object.cpp
+@@ -0,0 +1,476 @@
++// Validates the AMDGPU code objects the HIP backend embeds, without any AMD
++// hardware or the HIP runtime: compile a couple of tiny GPU pipelines for
++// fixed hip_gfx* targets, pull the embedded ".hsaco" bytes out of the
++// Module, and check the ELF the way hipModuleLoadData would.
++//
++// Tests only link against libHalide, which does not export LLVM's object
++// library, so the ELF is parsed by hand below.
++
++#include "Halide.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++using namespace Halide;
++
++namespace {
++
++// ELF constants (from the ELF spec and llvm/BinaryFormat/ELF.h).
++constexpr uint16_t ET_DYN = 3;
++constexpr uint16_t EM_AMDGPU = 224;
++constexpr uint8_t ELFOSABI_AMDGPU_HSA = 64;
++constexpr uint32_t SHT_SYMTAB = 2;
++constexpr uint32_t SHT_RELA = 4;
++constexpr uint32_t SHT_NOTE = 7;
++constexpr uint32_t SHT_DYNSYM = 11;
++constexpr uint64_t SHF_ALLOC = 2;
++constexpr uint16_t SHN_UNDEF = 0;
++constexpr uint8_t STT_OBJECT = 1;
++constexpr uint8_t STT_FUNC = 2;
++constexpr uint32_t NT_AMDGPU_METADATA = 32;
++constexpr uint32_t EF_AMDGPU_MACH = 0x0ff;
++constexpr uint32_t EF_AMDGPU_MACH_AMDGCN_GFX942 = 0x04c;
++constexpr uint32_t EF_AMDGPU_MACH_AMDGCN_GFX1100 = 0x041;
++
++struct Section {
++    std::string name;
++    uint32_t type = 0;
++    uint64_t flags = 0, addr = 0, offset = 0, size = 0;
++    uint32_t link = 0, info = 0;
++    uint64_t entsize = 0;
++};
++
++struct Symbol {
++    std::string name;
++    uint8_t type = 0;
++    uint16_t shndx = 0;
++    uint64_t value = 0, size = 0;
++};
++
++// A minimal reader for little-endian ELF64 files.
++class Elf {
++public:
++    Elf(const uint8_t *data, size_t size)
++        : data(data), size(size) {
++    }
++
++    uint8_t osabi = 0, abiversion = 0;
++    uint16_t type = 0, machine = 0;
++    uint32_t flags = 0;
++    std::vector<Section> sections;
++
++    bool parse(std::string &err) {
++        if (size < 64) {
++            err = "file is smaller than an ELF header";
++            return false;
++        }
++        if (memcmp(data, "\x7f"
++                         "ELF",
++                   4) != 0) {
++            err = "bad ELF magic";
++            return false;
++        }
++        if (data[4] != 2 /* ELFCLASS64 */) {
++            err = "not ELFCLASS64";
++            return false;
++        }
++        if (data[5] != 1 /* ELFDATA2LSB */) {
++            err = "not little-endian";
++            return false;
++        }
++        osabi = data[7];
++        abiversion = data[8];
++        type = u16(16);
++        machine = u16(18);
++        flags = u32(48);
++        uint64_t shoff = u64(40);
++        uint16_t shentsize = u16(58);
++        uint16_t shnum = u16(60);
++        uint16_t shstrndx = u16(62);
++        if (shentsize != 64 || !in_range(shoff, (uint64_t)shnum * 64)) {
++            err = "bad section header table";
++            return false;
++        }
++        for (uint16_t i = 0; i < shnum; i++) {
++            size_t off = (size_t)(shoff + (uint64_t)i * 64);
++            Section s;
++            s.type = u32(off + 4);
++            s.flags = u64(off + 8);
++            s.addr = u64(off + 16);
++            s.offset = u64(off + 24);
++            s.size = u64(off + 32);
++            s.link = u32(off + 40);
++            s.info = u32(off + 44);
++            s.entsize = u64(off + 56);
++            s.name = std::to_string(u32(off));  // patched below
++            sections.push_back(s);
++        }
++        if (shstrndx >= sections.size()) {
++            err = "bad e_shstrndx";
++            return false;
++        }
++        const Section &shstr = sections[shstrndx];
++        for (uint16_t i = 0; i < shnum; i++) {
++            size_t off = (size_t)(shoff + (uint64_t)i * 64);
++            sections[i].name = string_at(shstr, u32(off));
++        }
++        return true;
++    }
++
++    const Section *find_section(const std::string &name) const {
++        for (const Section &s : sections) {
++            if (s.name == name) {
++                return &s;
++            }
++        }
++        return nullptr;
++    }
++
++    std::vector<Symbol> symbols(const Section &symtab) const {
++        std::vector<Symbol> result;
++        if (symtab.entsize != 24 || symtab.link >= sections.size() ||
++            !in_range(symtab.offset, symtab.size)) {
++            return result;
++        }
++        const Section &strtab = sections[symtab.link];
++        for (uint64_t off = symtab.offset; off + 24 <= symtab.offset + symtab.size; off += 24) {
++            Symbol sym;
++            sym.name = string_at(strtab, u32((size_t)off));
++            sym.type = data[off + 4] & 0xf;
++            sym.shndx = u16((size_t)off + 6);
++            sym.value = u64((size_t)off + 8);
++            sym.size = u64((size_t)off + 16);
++            result.push_back(sym);
++        }
++        return result;
++    }
++
++    // All symbols from every SHT_SYMTAB / SHT_DYNSYM section.
++    std::vector<Symbol> all_symbols() const {
++        std::vector<Symbol> result;
++        for (const Section &s : sections) {
++            if (s.type == SHT_SYMTAB || s.type == SHT_DYNSYM) {
++                std::vector<Symbol> syms = symbols(s);
++                result.insert(result.end(), syms.begin(), syms.end());
++            }
++        }
++        return result;
++    }
++
++    // Finds a note of the given type and owner name in a SHT_NOTE section and
++    // returns its descriptor.
++    bool find_note(const Section &s, uint32_t want_type, const std::string &want_name,
++                   std::string &desc) const {
++        if (!in_range(s.offset, s.size)) {
++            return false;
++        }
++        uint64_t off = s.offset;
++        uint64_t end = s.offset + s.size;
++        while (off + 12 <= end) {
++            uint32_t namesz = u32((size_t)off);
++            uint32_t descsz = u32((size_t)off + 4);
++            uint32_t ntype = u32((size_t)off + 8);
++            uint64_t name_off = off + 12;
++            uint64_t desc_off = name_off + ((namesz + 3) & ~3u);
++            uint64_t next = desc_off + ((descsz + 3) & ~3u);
++            if (next > end) {
++                return false;
++            }
++            std::string name((const char *)data + name_off, namesz);
++            while (!name.empty() && name.back() == '\0') {
++                name.pop_back();
++            }
++            if (ntype == want_type && name == want_name) {
++                desc.assign((const char *)data + desc_off, descsz);
++                return true;
++            }
++            off = next;
++        }
++        return false;
++    }
++
++    // Reads n bytes at a virtual address, via the allocated section that
++    // contains it.
++    bool read_at_vaddr(uint64_t vaddr, size_t n, std::vector<uint8_t> &out) const {
++        for (const Section &s : sections) {
++            if ((s.flags & SHF_ALLOC) && s.type != 8 /* SHT_NOBITS */ &&
++                vaddr >= s.addr && vaddr + n <= s.addr + s.size) {
++                uint64_t off = s.offset + (vaddr - s.addr);
++                if (!in_range(off, n)) {
++                    return false;
++                }
++                out.assign(data + off, data + off + n);
++                return true;
++            }
++        }
++        return false;
++    }
++
++    uint16_t u16(size_t off) const {
++        return (uint16_t)(data[off] | (data[off + 1] << 8));
++    }
++    uint32_t u32(size_t off) const {
++        return (uint32_t)data[off] | ((uint32_t)data[off + 1] << 8) |
++               ((uint32_t)data[off + 2] << 16) | ((uint32_t)data[off + 3] << 24);
++    }
++    uint64_t u64(size_t off) const {
++        return (uint64_t)u32(off) | ((uint64_t)u32(off + 4) << 32);
++    }
++
++private:
++    const uint8_t *data;
++    size_t size;
++
++    bool in_range(uint64_t off, uint64_t n) const {
++        return off <= size && n <= size - off;
++    }
++
++    std::string string_at(const Section &strtab, uint32_t idx) const {
++        if (!in_range(strtab.offset, strtab.size) || idx >= strtab.size) {
++            return "";
++        }
++        const char *start = (const char *)data + strtab.offset + idx;
++        size_t max_len = (size_t)(strtab.size - idx);
++        return std::string(start, strnlen(start, max_len));
++    }
++};
++
++int failures = 0;
++
++#define CHECK(cond, ...)                                            \
++    do {                                                            \
++        if (!(cond)) {                                              \
++            printf("FAIL [%s] %s:%d: ", label, __FILE__, __LINE__); \
++            printf(__VA_ARGS__);                                    \
++            printf("\n");                                           \
++            failures++;                                             \
++        }                                                           \
++    } while (0)
++
++// EI_ABIVERSION for the code object version the backend was asked for
++// (ELFABIVERSION_AMDGPU_HSA_V4 = 2, _V5 = 3, _V6 = 4).
++uint8_t expected_abi_version() {
++    const char *cov = getenv("HL_HIP_CODE_OBJECT_VERSION");
++    int v = cov ? atoi(cov) : 5;
++    return (uint8_t)(v - 2);
++}
++
++void check_code_object(const Buffer<> &code, const char *label, uint32_t expected_mach) {
++    CHECK(code.defined(), "no device code buffer was embedded in the Module");
++    if (!code.defined()) {
++        return;
++    }
++    CHECK(code.name().rfind("hip_", 0) == 0, "device code buffer is named %s, expected hip_*", code.name().c_str());
++
++    const uint8_t *bytes = (const uint8_t *)code.data();
++    size_t size = code.size_in_bytes();
++    printf("[%s] code object: %zu bytes\n", label, size);
++
++    // The bytes are a binary ELF, not NUL-terminated text: the file header
++    // starts at byte 0 and the size passed to the runtime is exact.
++    Elf elf(bytes, size);
++    std::string err;
++    if (!elf.parse(err)) {
++        CHECK(false, "not a parseable ELF64: %s", err.c_str());
++        return;
++    }
++
++    // File header.
++    CHECK(elf.machine == EM_AMDGPU, "e_machine is %u, expected EM_AMDGPU (224)", elf.machine);
++    CHECK(elf.osabi == ELFOSABI_AMDGPU_HSA, "EI_OSABI is %u, expected ELFOSABI_AMDGPU_HSA (64)", elf.osabi);
++    CHECK(elf.type == ET_DYN, "e_type is %u, expected ET_DYN (3): the object was not linked", elf.type);
++    CHECK(elf.abiversion == expected_abi_version(), "EI_ABIVERSION is %u, expected %u",
++          elf.abiversion, expected_abi_version());
++    CHECK((elf.flags & EF_AMDGPU_MACH) == expected_mach, "e_flags mach is 0x%x, expected 0x%x",
++          elf.flags & EF_AMDGPU_MACH, expected_mach);
++
++    // Kernels: every STT_FUNC symbol is a kernel entry point.
++    std::vector<Symbol> syms = elf.all_symbols();
++    std::vector<std::string> kernels;
++    for (const Symbol &s : syms) {
++        if (s.type == STT_FUNC && s.shndx != SHN_UNDEF && !s.name.empty()) {
++            bool seen = false;
++            for (const std::string &k : kernels) {
++                seen |= (k == s.name);
++            }
++            if (!seen) {
++                kernels.push_back(s.name);
++            }
++        }
++    }
++    CHECK(!kernels.empty(), "no STT_FUNC symbol (kernel) found");
++    for (const std::string &k : kernels) {
++        printf("[%s] kernel: %s\n", label, k.c_str());
++    }
++
++    // The metadata note the HIP runtime reads the kernarg layout from.
++    std::string metadata;
++    bool found_note = false;
++    for (const Section &s : elf.sections) {
++        if (s.type == SHT_NOTE && elf.find_note(s, NT_AMDGPU_METADATA, "AMDGPU", metadata)) {
++            found_note = true;
++            break;
++        }
++    }
++    CHECK(found_note, "no NT_AMDGPU_METADATA (type 32, name \"AMDGPU\") note");
++    if (found_note) {
++        // msgpack encodes the map keys and string values verbatim, so a
++        // substring search is enough to see the fields are there.
++        CHECK(metadata.find("amdhsa.kernels") != std::string::npos, "metadata lacks amdhsa.kernels");
++        CHECK(metadata.find(".kernarg_segment_size") != std::string::npos, "metadata lacks .kernarg_segment_size");
++        CHECK(metadata.find(".args") != std::string::npos, "metadata lacks .args");
++        for (const std::string &k : kernels) {
++            CHECK(metadata.find(k) != std::string::npos, "metadata does not mention kernel %s", k.c_str());
++        }
++    }
++
++    // Nothing may be left for the loader to resolve.
++    const Section *dynsym = elf.find_section(".dynsym");
++    CHECK(dynsym != nullptr, "no .dynsym section (hipModuleGetFunction looks kernels up there)");
++    if (dynsym) {
++        std::vector<Symbol> dsyms = elf.symbols(*dynsym);
++        for (size_t i = 1; i < dsyms.size(); i++) {
++            CHECK(dsyms[i].shndx != SHN_UNDEF, "undefined dynamic symbol: %s", dsyms[i].name.c_str());
++        }
++        bool has_kernel = false;
++        for (const Symbol &s : dsyms) {
++            for (const std::string &k : kernels) {
++                has_kernel |= (s.name == k);
++            }
++        }
++        CHECK(has_kernel, "no kernel is exported through .dynsym");
++    }
++    for (const Symbol &s : syms) {
++        CHECK(!(s.name == "__halide_dynamic_lds" && s.shndx == SHN_UNDEF),
++              "__halide_dynamic_lds survived as an undefined symbol (dynamic LDS was not lowered)");
++    }
++    for (const Section &s : elf.sections) {
++        if (s.type != SHT_RELA || s.entsize != 24 || s.link >= elf.sections.size()) {
++            continue;
++        }
++        std::vector<Symbol> rsyms = elf.symbols(elf.sections[s.link]);
++        for (uint64_t off = s.offset; off + 24 <= s.offset + s.size; off += 24) {
++            uint64_t info = elf.u64((size_t)off + 8);
++            uint32_t sym_idx = (uint32_t)(info >> 32);
++            if (sym_idx == 0) {
++                continue;  // base-relative (R_AMDGPU_RELATIVE64): resolved by the loader
++            }
++            const char *sym_name = sym_idx < rsyms.size() ? rsyms[sym_idx].name.c_str() : "?";
++            bool undefined = sym_idx < rsyms.size() && rsyms[sym_idx].shndx == SHN_UNDEF;
++            CHECK(!undefined, "%s has a relocation against undefined symbol %s", s.name.c_str(), sym_name);
++            if (!undefined) {
++                printf("[%s] note: %s has a symbolic relocation against %s\n", label, s.name.c_str(), sym_name);
++            }
++        }
++    }
++
++    // Kernel descriptors: group_segment_fixed_size@0, private@4, kernarg_size@8.
++    for (const std::string &k : kernels) {
++        const Symbol *kd = nullptr;
++        for (const Symbol &s : syms) {
++            if (s.name == k + ".kd" && s.shndx != SHN_UNDEF) {
++                kd = &s;
++                break;
++            }
++        }
++        CHECK(kd != nullptr, "no kernel descriptor symbol %s.kd", k.c_str());
++        if (!kd) {
++            continue;
++        }
++        CHECK(kd->type == STT_OBJECT, "%s.kd is not an STT_OBJECT symbol", k.c_str());
++        CHECK(kd->size == 64, "%s.kd has size %llu, expected 64", k.c_str(), (unsigned long long)kd->size);
++        std::vector<uint8_t> desc;
++        if (!elf.read_at_vaddr(kd->value, 64, desc)) {
++            CHECK(false, "could not read the 64 bytes of %s.kd", k.c_str());
++            continue;
++        }
++        Elf kd_view(desc.data(), desc.size());
++        uint32_t group_segment_fixed_size = kd_view.u32(0);
++        uint32_t kernarg_size = kd_view.u32(8);
++        printf("[%s] %s.kd: group_segment_fixed_size=%u kernarg_size=%u\n",
++               label, k.c_str(), group_segment_fixed_size, kernarg_size);
++        // Shared memory is always dynamic LDS sized at launch, so the static
++        // group segment must stay 0 whether or not the kernel uses any.
++        CHECK(group_segment_fixed_size == 0, "%s.kd group_segment_fixed_size is %u, expected 0 (dynamic LDS)",
++              k.c_str(), group_segment_fixed_size);
++        // Two buffer pointers (8 bytes each) at least.
++        CHECK(kernarg_size >= 16, "%s.kd kernarg_size is %u, expected >= 16", k.c_str(), kernarg_size);
++    }
++}
++
++enum class Variant {
++    Simple,  // out[x] = in[x] + p
++    Shared,  // a per-block Func staged in shared memory, with a barrier
++    Atomic,  // an f32 histogram with atomic updates
++};
++
++Buffer<> compile_pipeline(const Target &t, Variant variant) {
++    ImageParam in(Int(32), 1, "in");
++    Param<int> p("p");
++    Var x("x"), xo("xo"), xi("xi");
++    Func f("f");
++
++    if (variant == Variant::Atomic) {
++        // Two kernels in one code object: the atomic histogram update and
++        // the consumer. The f32 atomicrmw is what the
++        // !amdgpu.no.fine.grained.memory metadata gates on: with it the
++        // backend selects global_atomic_add_f32 on gfx942 instead of a
++        // compare-and-swap loop.
++        Func hist("hist");
++        Var i("i");
++        RDom r(0, 1024, "r");
++        RVar ro("ro"), ri("ri");
++        hist(i) = 0.0f;
++        hist(clamp(in(r), 0, 15)) += 1.0f;
++        hist.compute_root();
++        hist.update().atomic().gpu_tile(r, ro, ri, 64);
++        f(x) = cast<int>(hist(clamp(x, 0, 15))) + p;
++        f.gpu_tile(x, xo, xi, 64);
++    } else if (variant == Variant::Shared) {
++        // g is computed per block by the block's threads into shared memory,
++        // so the kernel has an LDS allocation and a barrier.
++        Func g("g");
++        g(x) = in(x) * 2;
++        f(x) = g(x) + g(x + 1) + p;
++        f.gpu_tile(x, xo, xi, 64);
++        g.compute_at(f, xo).gpu_threads(x);
++    } else {
++        f(x) = in(x) + p;
++        f.gpu_tile(x, xo, xi, 64);
++    }
++
++    Module m = f.compile_to_module({in, p}, "hip_code_object_test", t);
++    return m.get_device_code_buffer();
++}
++
++}  // namespace
++
++int main(int argc, char **argv) {
++    Target gfx942("host-hip-hip_gfx942");
++    if (!gfx942.supported()) {
++        printf("[SKIP] Halide was built without the AMDGPU backend (WITH_AMDGPU).\n");
++        return 0;
++    }
++    if (getenv("HL_HIP_ARCH")) {
++        printf("[SKIP] HL_HIP_ARCH is set; it overrides the hip_gfx* features this test checks.\n");
++        return 0;
++    }
++
++    check_code_object(compile_pipeline(gfx942, Variant::Simple), "gfx942", EF_AMDGPU_MACH_AMDGCN_GFX942);
++    check_code_object(compile_pipeline(gfx942, Variant::Shared), "gfx942+shared", EF_AMDGPU_MACH_AMDGCN_GFX942);
++    check_code_object(compile_pipeline(gfx942, Variant::Atomic), "gfx942+atomic", EF_AMDGPU_MACH_AMDGCN_GFX942);
++
++    Target gfx1100("host-hip-hip_gfx1100");
++    check_code_object(compile_pipeline(gfx1100, Variant::Simple), "gfx1100", EF_AMDGPU_MACH_AMDGCN_GFX1100);
++
++    if (failures) {
++        printf("%d check(s) failed\n", failures);
++        return 1;
++    }
++    printf("Success!\n");
++    return 0;
++}
+-- 
+2.43.0
+

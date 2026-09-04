@@ -1,0 +1,12 @@
+# Infra / cloud / edge on AMD (Sep 2026) — key findings
+- Ray: ROCm/ray fork retired -> upstream; Instinct-only accelerator types; ~1 ROCm-version lag; thin docs.
+- K8s: AMD GPU Operator v1.4-1.5, ~4-5 yrs younger than NVIDIA's. Issues: node-labeller miscounts memory on partitioned modes (#555 May 2026), cluster-partition orchestration FR open (#362), CVEs in 1.5.1 (#629), no Ubuntu 26.04 build (#631), torch.cuda.mem_get_info on HIP breaks (#330).
+- Slurm: manual Flags=amd_gpu_env; no NVML/DCGM-grade autodetect/accounting.
+- SkyPilot: works, manual cert-manager+operator+node labels; thin docs.
+- Cloud: AWS ZERO Instinct EC2 instances; Azure 1 SKU; OCI $6/GPU-hr; neoclouds self-serve (Hot Aisle $2.99, DigitalOcean, RunPod $2.39, Vultr $1.85); TensorWave quote-only; Lambda none. AMD Developer Cloud 25 free GPU-hours.
+- HF optimum-amd DORMANT: 4 commits in 2025-2026, removed from Optimum docs nav.
+- Monitoring: ROCm/device-metrics-exporter (DCGM analog) works, 64 stars, ecosystem-thin.
+- ROS 2: blog tutorials only, no Isaac ROS equivalent (no accelerated perception packages). No Isaac Sim / Jetson equivalent — patchwork demos (Schola+Unreal Jun 2026, MuJoCo+JAX Mar 2026, Digital Twins Feb 2026, STX-B0T Oct 2025).
+- NPU/XDNA: in-kernel amdxdna since Linux 6.14 but AMD recommends out-of-tree driver (IOCTL mismatches); llama.cpp NO XDNA backend (#21725 open); Lemonade SDK is the only NPU inference story (Windows-strongest); IRON/mlir-aie low-level.
+- awesome-rocm lists: fragmented, low-star (pkucnc 33★ May 2025; AMD employee lists 3-5★). Authoritative = rocm.docs compatibility matrix.
+- ROCm/ROCm repo being deprecated in favor of ROCm/TheRock.

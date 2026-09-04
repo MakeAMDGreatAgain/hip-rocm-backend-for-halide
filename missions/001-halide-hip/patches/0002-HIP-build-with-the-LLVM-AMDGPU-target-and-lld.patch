@@ -1,0 +1,450 @@
+From 4e813e78ca1084a2b2b3dddcbc2af093fa5ee4d2 Mon Sep 17 00:00:00 2001
+From: Oussama Benjelloun <benje.oussama@gmail.com>
+Date: Fri, 4 Sep 2026 14:25:02 +0200
+Subject: [PATCH 2/7] HIP: build with the LLVM AMDGPU target and lld
+
+Re-adds AMDGPU as an optional Halide_LLVM component (dropped in #8382),
+links lldELF/lldCommon when available (same policy as WebAssembly),
+initializes the AMDGPU target/asm parser/asm printer, registers the hip,
+windows_hip and amdgpu_dev runtime modules, and instantiates the AMDGPU
+device codegen from the GPU offload pass.
+
+Co-authored-by: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ CMakeLists.txt              |  2 +-
+ Makefile                    | 19 +++++++++++++--
+ cmake/FindHalide_LLVM.cmake | 44 ++++++++++++++++++++++++-----------
+ src/CMakeLists.txt          |  2 ++
+ src/CodeGen_LLVM.cpp        |  6 +++++
+ src/LLVM_Headers.h          |  2 +-
+ src/LLVM_Runtime_Linker.cpp | 46 +++++++++++++++++++++++++++++++++++++
+ src/LLVM_Runtime_Linker.h   |  3 +++
+ src/OffloadGPULoops.cpp     |  4 ++++
+ src/runtime/CMakeLists.txt  |  4 ++++
+ vcpkg.json                  | 14 +++++++++++
+ 11 files changed, 128 insertions(+), 18 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0d427fd..b253d68 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -194,7 +194,7 @@ find_package(Threads REQUIRED)
+ find_package(
+     Halide_LLVM 21...99 REQUIRED  # Use 99 to fake a minimum-only constraint
+     COMPONENTS WebAssembly X86
+-    OPTIONAL_COMPONENTS AArch64 ARM Hexagon NVPTX PowerPC RISCV
++    OPTIONAL_COMPONENTS AArch64 AMDGPU ARM Hexagon NVPTX PowerPC RISCV
+ )
+ 
+ _Halide_pkgdep(Halide_LLVM PACKAGE_VARS Halide_LLVM_SHARED_LIBS)
+diff --git a/Makefile b/Makefile
+index c66ac32..90e35e7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -126,6 +126,9 @@ WITH_RISCV ?= $(findstring riscv, $(LLVM_COMPONENTS))
+ WITH_AARCH64 ?= $(findstring aarch64, $(LLVM_COMPONENTS))
+ WITH_POWERPC ?= $(findstring powerpc, $(LLVM_COMPONENTS))
+ WITH_NVPTX ?= $(findstring nvptx, $(LLVM_COMPONENTS))
++# The AMDGPU (HIP) backend also needs liblld (lldELF) to link code objects,
++# so only enable it by default when both the LLVM component and lld are present.
++WITH_AMDGPU ?= $(if $(wildcard $(LLVM_LIBDIR)/liblldELF.*),$(findstring amdgpu, $(LLVM_COMPONENTS)),)
+ WITH_WEBASSEMBLY ?= $(findstring webassembly, $(LLVM_COMPONENTS))
+ WITH_OPENCL ?= not-empty
+ WITH_METAL ?= not-empty
+@@ -154,6 +157,12 @@ PTX_CXX_FLAGS=$(if $(WITH_NVPTX), -DWITH_NVPTX, )
+ PTX_LLVM_CONFIG_LIB=$(if $(WITH_NVPTX), nvptx, )
+ PTX_DEVICE_INITIAL_MODULES=$(if $(WITH_NVPTX), $(BUILD_DIR)/initmod_ptx.libdevice_ll.o, )
+ 
++AMDGPU_CXX_FLAGS=$(if $(WITH_AMDGPU), -DWITH_AMDGPU, )
++AMDGPU_LLVM_CONFIG_LIB=$(if $(WITH_AMDGPU), amdgpu, )
++# The HIP backend links its code objects with lld's ELF driver in-process.
++# llvm-config does not know about lld, so these libraries are added by hand.
++AMDGPU_LLD_LIBS=$(if $(WITH_AMDGPU), -llldELF -llldCommon, )
++
+ OPENCL_CXX_FLAGS=$(if $(WITH_OPENCL), -DWITH_OPENCL, )
+ OPENCL_LLVM_CONFIG_LIB=$(if $(WITH_OPENCL), , )
+ 
+@@ -206,6 +215,7 @@ endif
+ CXX_FLAGS = $(CXXFLAGS) $(CXX_WARNING_FLAGS) $(RTTI_CXX_FLAGS) -Woverloaded-virtual $(FPIC) $(OPTIMIZE) -fno-omit-frame-pointer -DCOMPILING_HALIDE
+ CXX_FLAGS += $(LLVM_CXX_FLAGS)
+ CXX_FLAGS += $(PTX_CXX_FLAGS)
++CXX_FLAGS += $(AMDGPU_CXX_FLAGS)
+ CXX_FLAGS += $(ARM_CXX_FLAGS)
+ CXX_FLAGS += $(HEXAGON_CXX_FLAGS)
+ CXX_FLAGS += $(AARCH64_CXX_FLAGS)
+@@ -247,6 +257,7 @@ LLVM_STATIC_LIBFILES = \
+ 	$(OPENCL_LLVM_CONFIG_LIB) \
+ 	$(METAL_LLVM_CONFIG_LIB) \
+ 	$(PTX_LLVM_CONFIG_LIB) \
++	$(AMDGPU_LLVM_CONFIG_LIB) \
+ 	$(AARCH64_LLVM_CONFIG_LIB) \
+ 	$(POWERPC_LLVM_CONFIG_LIB) \
+ 	$(HEXAGON_LLVM_CONFIG_LIB) \
+@@ -255,12 +266,12 @@ LLVM_STATIC_LIBFILES = \
+ 	$(WEBASSEMBLY_LLVM_CONFIG_LIB) \
+ 	$(RISCV_LLVM_CONFIG_LIB)
+ 
+-LLVM_STATIC_LIBS = -L $(LLVM_LIBDIR) $(shell $(LLVM_CONFIG) --link-static --libfiles $(LLVM_STATIC_LIBFILES) | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
++LLVM_STATIC_LIBS = -L $(LLVM_LIBDIR) $(AMDGPU_LLD_LIBS) $(shell $(LLVM_CONFIG) --link-static --libfiles $(LLVM_STATIC_LIBFILES) | sed -e 's/\\/\//g' -e 's/\([a-zA-Z]\):/\/\1/g')
+ 
+ # Add a rpath to the llvm used for linking, in case multiple llvms are
+ # installed. Bakes a path on the build system into the .so, so don't
+ # use this config for distributions.
+-LLVM_SHARED_LIBS = -Wl,-rpath=$(LLVM_LIBDIR) -L $(LLVM_LIBDIR) -lLLVM
++LLVM_SHARED_LIBS = -Wl,-rpath=$(LLVM_LIBDIR) -L $(LLVM_LIBDIR) $(AMDGPU_LLD_LIBS) -lLLVM
+ 
+ LLVM_LIBS_FOR_SHARED_LIBHALIDE=$(if $(WITH_LLVM_INSIDE_SHARED_LIBHALIDE),$(LLVM_STATIC_LIBS),$(LLVM_SHARED_LIBS))
+ 
+@@ -859,6 +870,7 @@ RUNTIME_CPP_COMPONENTS = \
+   hexagon_dma \
+   hexagon_dma_pool \
+   hexagon_host \
++  hip \
+   ios_io \
+   linux_arm_cpu_features \
+   linux_arm_thread_id \
+@@ -921,6 +933,7 @@ RUNTIME_CPP_COMPONENTS = \
+   windows_d3d12compute_arm \
+   windows_d3d12compute_x86 \
+   windows_get_symbol \
++  windows_hip \
+   windows_io \
+   windows_opencl \
+   windows_profiler \
+@@ -935,6 +948,7 @@ RUNTIME_CPP_COMPONENTS = \
+ # keep-sorted start skip_lines=1
+ RUNTIME_LL_COMPONENTS = \
+   aarch64 \
++  amdgpu_dev \
+   arm \
+   arm_no_neon \
+   hvx_128 \
+@@ -956,6 +970,7 @@ RUNTIME_EXPORTED_INCLUDES = $(INCLUDE_DIR)/HalideRuntime.h \
+                             $(INCLUDE_DIR)/HalideRuntimeCuda.h \
+                             $(INCLUDE_DIR)/HalideRuntimeHexagonDma.h \
+                             $(INCLUDE_DIR)/HalideRuntimeHexagonHost.h \
++                            $(INCLUDE_DIR)/HalideRuntimeHIP.h \
+                             $(INCLUDE_DIR)/HalideRuntimeOpenCL.h \
+                             $(INCLUDE_DIR)/HalideRuntimeMetal.h	\
+                             $(INCLUDE_DIR)/HalideRuntimeQurt.h \
+diff --git a/cmake/FindHalide_LLVM.cmake b/cmake/FindHalide_LLVM.cmake
+index 2901ab3..a939f70 100644
+--- a/cmake/FindHalide_LLVM.cmake
++++ b/cmake/FindHalide_LLVM.cmake
+@@ -56,26 +56,34 @@ if (LLVM_FOUND)
+         "${LLVM_DIR}/../lib/cmake/clang"  # LLVM found in $ROOT/cmake
+     )
+ 
++    # Both the WebAssembly (lldWasm) and AMDGPU (lldELF, for linking HIP code
++    # objects in-process) backends need liblld. Look for it once, up front.
++    find_package(
++        LLD "${Halide_LLVM_VERSION}" EXACT
++        HINTS
++        "${LLVM_INSTALL_PREFIX}"
++        # Homebrew split the LLVM and LLD packages as of version 19, so
++        # having multiple LLVM versions installed leads to the newest
++        # LLD being found without this hint.
++        "${LLVM_DIR}/../../../../lld@${LLVM_VERSION_MAJOR}"
++        "${LLVM_DIR}/../lld"
++        "${LLVM_DIR}/../lib/cmake/lld"
++    )
++
+     foreach (comp IN LISTS LLVM_TARGETS_TO_BUILD)
+-        if (comp STREQUAL "WebAssembly")
++        if (comp STREQUAL "WebAssembly" OR comp STREQUAL "AMDGPU")
+             set(Halide_LLVM_${comp}_FOUND 0)
+ 
+-            find_package(
+-                LLD "${Halide_LLVM_VERSION}" EXACT
+-                HINTS
+-                "${LLVM_INSTALL_PREFIX}"
+-                # Homebrew split the LLVM and LLD packages as of version 19, so
+-                # having multiple LLVM versions installed leads to the newest
+-                # LLD being found without this hint.
+-                "${LLVM_DIR}/../../../../lld@${LLVM_VERSION_MAJOR}"
+-                "${LLVM_DIR}/../lld"
+-                "${LLVM_DIR}/../lib/cmake/lld"
+-            )
+             if (NOT LLD_FOUND)
+                 string(APPEND REASON_FAILURE_MESSAGE
+-                    "WebAssembly was not found because liblld is missing. "
++                    "${comp} was not found because liblld is missing. "
+                     "Did you `apt install liblld-dev` or `brew install lld`?\n"
+                 )
++                if (comp STREQUAL "AMDGPU")
++                    # AMDGPU is an optional component, so a missing liblld would
++                    # otherwise drop it silently.
++                    message(STATUS "Halide_LLVM: disabling the AMDGPU backend because liblld was not found")
++                endif ()
+                 continue()
+             endif ()
+ 
+@@ -85,10 +93,13 @@ if (LLVM_FOUND)
+             # runtime. See: https://github.com/halide/Halide/issues/5471
+             if (LLVM_LINK_LLVM_DYLIB AND NOT Halide_LLVM_SHARED_LIBS)
+                 string(APPEND REASON_FAILURE_MESSAGE
+-                    "WebAssembly was not found because LLD required by was linked to shared LLVM "
++                    "${comp} was not found because LLD required by was linked to shared LLVM "
+                     "(LLVM_LINK_LLVM_DYLIB=${LLVM_LINK_LLVM_DYLIB}) but static LLVM was requested "
+                     "(Halide_LLVM_SHARED_LIBS=${Halide_LLVM_SHARED_LIBS}).\n"
+                 )
++                if (comp STREQUAL "AMDGPU")
++                    message(STATUS "Halide_LLVM: disabling the AMDGPU backend because LLD was linked to shared LLVM but static LLVM was requested")
++                endif ()
+                 continue()
+             endif ()
+         endif ()
+@@ -174,6 +185,11 @@ if (Halide_LLVM_FOUND)
+             if (comp STREQUAL "WebAssembly")
+                 target_include_directories(Halide_LLVM::WebAssembly INTERFACE ${LLD_INCLUDE_DIRS})
+                 target_link_libraries(Halide_LLVM::WebAssembly INTERFACE lldWasm lldCommon)
++            elseif (comp STREQUAL "AMDGPU")
++                # The HIP backend links its ET_REL code objects into loadable
++                # ET_DYN .hsaco files with lld's ELF driver, in-process.
++                target_include_directories(Halide_LLVM::AMDGPU INTERFACE ${LLD_INCLUDE_DIRS})
++                target_link_libraries(Halide_LLVM::AMDGPU INTERFACE lldELF lldCommon)
+             endif ()
+         endif ()
+     endforeach ()
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 0221560..23ff4b5 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -77,6 +77,7 @@ target_sources(
+     CheckGPUCrossTalk.h
+     ClampUnsafeAccesses.h
+     Closure.h
++    CodeGen_AMDGPU_Dev.h
+     CodeGen_C.h
+     CodeGen_CPU.h
+     CodeGen_D3D12Compute_Dev.h
+@@ -261,6 +262,7 @@ target_sources(
+     CheckGPUCrossTalk.cpp
+     ClampUnsafeAccesses.cpp
+     Closure.cpp
++    CodeGen_AMDGPU_Dev.cpp
+     CodeGen_ARM.cpp
+     CodeGen_C.cpp
+     CodeGen_CPU.cpp
+diff --git a/src/CodeGen_LLVM.cpp b/src/CodeGen_LLVM.cpp
+index 67b91e9..4475c99 100644
+--- a/src/CodeGen_LLVM.cpp
++++ b/src/CodeGen_LLVM.cpp
+@@ -96,6 +96,12 @@ using std::vector;
+ #define InitializeNVPTXAsmPrinter() InitializeAsmPrinter(NVPTX)
+ #endif
+ 
++#ifdef WITH_AMDGPU
++#define InitializeAMDGPUTarget() InitializeTarget(AMDGPU)
++#define InitializeAMDGPUAsmParser() InitializeAsmParser(AMDGPU)
++#define InitializeAMDGPUAsmPrinter() InitializeAsmPrinter(AMDGPU)
++#endif
++
+ #ifdef WITH_AARCH64
+ #define InitializeAArch64Target() InitializeTarget(AArch64)
+ #define InitializeAArch64AsmParser() InitializeAsmParser(AArch64)
+diff --git a/src/LLVM_Headers.h b/src/LLVM_Headers.h
+index 99cccec..0f95493 100644
+--- a/src/LLVM_Headers.h
++++ b/src/LLVM_Headers.h
+@@ -20,7 +20,7 @@
+ 
+ // IWYU pragma: begin_exports
+ 
+-#if WITH_WABT || WITH_V8
++#if WITH_WABT || WITH_V8 || WITH_AMDGPU
+ #include <lld/Common/Driver.h>
+ #include <lld/Common/ErrorHandler.h>
+ #endif
+diff --git a/src/LLVM_Runtime_Linker.cpp b/src/LLVM_Runtime_Linker.cpp
+index dc612a1..655df39 100644
+--- a/src/LLVM_Runtime_Linker.cpp
++++ b/src/LLVM_Runtime_Linker.cpp
+@@ -139,6 +139,7 @@ DECLARE_CPP_INITMOD(hexagon_cache_allocator)
+ DECLARE_CPP_INITMOD(hexagon_dma)
+ DECLARE_CPP_INITMOD(hexagon_dma_pool)
+ DECLARE_CPP_INITMOD(hexagon_host)
++DECLARE_CPP_INITMOD(hip)
+ DECLARE_CPP_INITMOD(ios_io)
+ DECLARE_CPP_INITMOD(linux_arm_thread_id)
+ DECLARE_CPP_INITMOD(linux_clock)
+@@ -188,6 +189,7 @@ DECLARE_CPP_INITMOD(webgpu_emscripten)
+ DECLARE_CPP_INITMOD(windows_clock)
+ DECLARE_CPP_INITMOD(windows_cuda)
+ DECLARE_CPP_INITMOD(windows_get_symbol)
++DECLARE_CPP_INITMOD(windows_hip)
+ DECLARE_CPP_INITMOD(windows_io)
+ DECLARE_CPP_INITMOD(windows_opencl)
+ DECLARE_CPP_INITMOD(windows_profiler)
+@@ -199,6 +201,7 @@ DECLARE_CPP_INITMOD(write_debug_image)
+ 
+ // Universal LL Initmods
+ // keep-sorted start
++DECLARE_LL_INITMOD(amdgpu_dev)
+ DECLARE_LL_INITMOD(posix_math)
+ DECLARE_LL_INITMOD(ptx_dev)
+ DECLARE_LL_INITMOD(win32_math)
+@@ -1317,6 +1320,13 @@ std::unique_ptr<llvm::Module> get_initial_module_for_target(Target t, llvm::LLVM
+                 modules.push_back(get_initmod_cuda(c, bits_64, debug));
+             }
+         }
++        if (t.has_feature(Target::HIP)) {
++            if (t.os == Target::Windows) {
++                modules.push_back(get_initmod_windows_hip(c, bits_64, debug));
++            } else {
++                modules.push_back(get_initmod_hip(c, bits_64, debug));
++            }
++        }
+         if (t.has_feature(Target::OpenCL)) {
+             if (t.os == Target::Windows) {
+                 modules.push_back(get_initmod_windows_opencl(c, bits_64, debug));
+@@ -1437,6 +1447,42 @@ std::unique_ptr<llvm::Module> get_initial_module_for_ptx_device(Target target, l
+ }
+ #endif
+ 
++#ifdef WITH_AMDGPU
++std::unique_ptr<llvm::Module> get_initial_module_for_amdgpu_device(Target target, llvm::LLVMContext *c) {
++    std::vector<std::unique_ptr<llvm::Module>> modules;
++    modules.push_back(get_initmod_amdgpu_dev_ll(c));
++
++    // TODO(T5): link the vendored ROCm device library (ocml.bc) here once it
++    // is embedded, mirroring get_initmod_ptx_libdevice_ll above.
++
++    link_modules(modules, target);
++
++    // As with the PTX backend, the AMDGPU backend does not handle calling
++    // functions. Mark all definitions (not extern declarations) as
++    // AvailableExternally so they are inlined or deleted and never survive
++    // into the emitted code object. Anything explicitly marked noinline is
++    // left alone so it stays out-of-line and callable.
++    for (auto &f : *modules[0]) {
++        if (!f.isDeclaration() && !f.hasFnAttribute(llvm::Attribute::NoInline)) {
++            f.setLinkage(llvm::GlobalValue::AvailableExternallyLinkage);
++        }
++    }
++
++    llvm::Triple triple("amdgcn-amd-amdhsa");
++    modules[0]->setTargetTriple(triple);
++
++    // Deliberately no hard-coded data layout here: link_modules() above
++    // stamped the host-ish layout for the (arch-unknown) device Target onto
++    // the module, which is wrong for amdgcn (it needs p5 allocas, 32-bit LDS
++    // pointers, etc.). Reset it to the empty layout and let
++    // CodeGen_AMDGPU_Dev::init_module() set the authoritative layout from
++    // the TargetMachine, so it can never drift from the LLVM in use.
++    modules[0]->setDataLayout(llvm::DataLayout(""));
++
++    return std::move(modules[0]);
++}
++#endif
++
+ void add_bitcode_to_module(llvm::LLVMContext *context, llvm::Module &module,
+                            const std::vector<uint8_t> &bitcode, const std::string &name) {
+     llvm::StringRef sb = llvm::StringRef((const char *)&bitcode[0], bitcode.size());
+diff --git a/src/LLVM_Runtime_Linker.h b/src/LLVM_Runtime_Linker.h
+index 899f82a..137db12 100644
+--- a/src/LLVM_Runtime_Linker.h
++++ b/src/LLVM_Runtime_Linker.h
+@@ -32,6 +32,9 @@ std::unique_ptr<llvm::Module> get_initial_module_for_target(Target, llvm::LLVMCo
+ /** Create an llvm module containing the support code for ptx device. */
+ std::unique_ptr<llvm::Module> get_initial_module_for_ptx_device(Target, llvm::LLVMContext *c);
+ 
++/** Create an llvm module containing the support code for an AMDGPU (HIP) device. */
++std::unique_ptr<llvm::Module> get_initial_module_for_amdgpu_device(Target, llvm::LLVMContext *c);
++
+ /** Link a block of llvm bitcode into an llvm module. */
+ void add_bitcode_to_module(llvm::LLVMContext *context, llvm::Module &module,
+                            const std::vector<uint8_t> &bitcode, const std::string &name);
+diff --git a/src/OffloadGPULoops.cpp b/src/OffloadGPULoops.cpp
+index e67f6fa..f92c797 100644
+--- a/src/OffloadGPULoops.cpp
++++ b/src/OffloadGPULoops.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "CanonicalizeGPUVars.h"
+ #include "Closure.h"
++#include "CodeGen_AMDGPU_Dev.h"
+ #include "CodeGen_D3D12Compute_Dev.h"
+ #include "CodeGen_GPU_Dev.h"
+ #include "CodeGen_Metal_Dev.h"
+@@ -258,6 +259,9 @@ public:
+         if (target.has_feature(Target::CUDA)) {
+             cgdev[DeviceAPI::CUDA] = new_CodeGen_PTX_Dev(device_target);
+         }
++        if (target.has_feature(Target::HIP)) {
++            cgdev[DeviceAPI::HIP] = new_CodeGen_AMDGPU_Dev(device_target);
++        }
+         if (target.has_feature(Target::OpenCL)) {
+             cgdev[DeviceAPI::OpenCL] = new_CodeGen_OpenCL_Dev(device_target);
+         }
+diff --git a/src/runtime/CMakeLists.txt b/src/runtime/CMakeLists.txt
+index cac63a3..75ccb5c 100644
+--- a/src/runtime/CMakeLists.txt
++++ b/src/runtime/CMakeLists.txt
+@@ -34,6 +34,7 @@ set(RUNTIME_CPP
+     hexagon_dma
+     hexagon_dma_pool
+     hexagon_host
++    hip
+     ios_io
+     linux_arm_cpu_features
+     linux_arm_thread_id
+@@ -97,6 +98,7 @@ set(RUNTIME_CPP
+     windows_d3d12compute_arm
+     windows_d3d12compute_x86
+     windows_get_symbol
++    windows_hip
+     windows_io
+     windows_opencl
+     windows_profiler
+@@ -112,6 +114,7 @@ set(RUNTIME_CPP
+ set(RUNTIME_LL
+     # keep-sorted start
+     aarch64
++    amdgpu_dev
+     arm
+     arm_no_neon
+     hvx_128
+@@ -137,6 +140,7 @@ set(RUNTIME_HEADER_FILES
+     HalideRuntime.h
+     HalideRuntimeCuda.h
+     HalideRuntimeD3D12Compute.h
++    HalideRuntimeHIP.h
+     HalideRuntimeHexagonDma.h
+     HalideRuntimeHexagonHost.h
+     HalideRuntimeMetal.h
+diff --git a/vcpkg.json b/vcpkg.json
+index 6a40475..a8bafe4 100644
+--- a/vcpkg.json
++++ b/vcpkg.json
+@@ -111,6 +111,7 @@
+           "default-features": false,
+           "features": [
+             "target-aarch64",
++            "target-amdgpu",
+             "target-arm",
+             "target-hexagon",
+             "target-nvptx",
+@@ -120,6 +121,19 @@
+         }
+       ]
+     },
++    "target-amdgpu": {
++      "description": "Include AMDGPU target (HIP backend; needs lld)",
++      "dependencies": [
++        {
++          "name": "llvm",
++          "default-features": false,
++          "features": [
++            "lld",
++            "target-amdgpu"
++          ]
++        }
++      ]
++    },
+     "target-arm": {
+       "description": "Include ARM target",
+       "dependencies": [
+-- 
+2.43.0
+

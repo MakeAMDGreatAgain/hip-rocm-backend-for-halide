@@ -1,0 +1,140 @@
+# Mission 001 — compile-only CI for the Halide HIP/AMDGPU backend.
+#
+# Runs on a plain ubuntu-24.04 GitHub runner (no GPU, no ROCm):
+#   1. checkout this repo (amd-port-agent) for patches/ and scripts/
+#   2. clone halide/Halide at the SHA pinned in missions/001-halide-hip/STATUS.md,
+#      apply patches/*.patch with `git am`
+#   3. restore the LLVM 22.1.8 release tarball + locally built zstd from the
+#      actions/cache (keyed on the LLVM version), otherwise download/build them
+#   4. run scripts/wsl-setup.sh (same script developers use in WSL) → libHalide
+#   5. build + run the internal/ELF-validation tests (ctest -R 'internal|amdgpu|hip')
+#   6. run scripts/compile-verify.sh (smoke pipelines + apps, 4 archs)
+#   7. upload missions/001-halide-hip/results/ as an artifact (always)
+#
+# Paths are relative to the amd-port-agent repository root. To move this into a
+# Halide fork later: drop steps 2 (the fork *is* the checkout) and the patch
+# application, replace `scripts/wsl-setup.sh` with the fork's normal CMake
+# configure (LLVM with AMDGPU + lld), keep steps 5-7 (copy scripts/smoke and
+# scripts/compile-verify.sh under e.g. test/hip/ and point BUILD/HALIDE_SRC at
+# the fork's build dir), and place this file under .github/workflows/.
+name: halide-hip compile-only
+
+on:
+  push:
+    paths:
+      - "missions/001-halide-hip/patches/**"
+      - "missions/001-halide-hip/scripts/**"
+      - "missions/001-halide-hip/ci/halide-hip.yml"
+      - "missions/001-halide-hip/STATUS.md"
+  pull_request:
+    paths:
+      - "missions/001-halide-hip/**"
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: "space-separated gfx archs for compile-verify"
+        default: "gfx942 gfx1100 gfx1151 gfx1201"
+      skip_apps:
+        description: "set to 1 to skip the apps/ AOT sweep"
+        default: "0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LLVM_VER: "22.1.8"
+  MISSION: missions/001-halide-hip
+  # wsl-setup.sh hard-codes ROOT=$HOME/halide-hip; keep everything there.
+  ROOT: /home/runner/halide-hip
+
+jobs:
+  compile-verify:
+    name: compile-verify (ubuntu-24.04, LLVM 22.1.8, no GPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout amd-port-agent
+        uses: actions/checkout@v4
+
+      - name: Read pinned Halide SHA from STATUS.md
+        id: pin
+        run: |
+          sha="$(grep -oE 'main` @ `[0-9a-f]{40}' "$MISSION/STATUS.md" | grep -oE '[0-9a-f]{40}' | head -1)"
+          test -n "$sha" || { echo "::error::no pinned SHA in $MISSION/STATUS.md"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "pinned Halide SHA: $sha"
+
+      - name: System packages (apps need libpng/libjpeg; the rest is user-space)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libpng-dev libjpeg-dev pkg-config
+
+      - name: Clone Halide at the pinned SHA and apply the patch series
+        run: |
+          mkdir -p "$ROOT"
+          git clone --filter=blob:none https://github.com/halide/Halide.git "$ROOT/Halide"
+          cd "$ROOT/Halide"
+          git checkout -q "${{ steps.pin.outputs.sha }}"
+          git checkout -q -b hip-backend
+          n="$(ls "$GITHUB_WORKSPACE/$MISSION/patches"/*.patch 2>/dev/null | wc -l)"
+          test "$n" -gt 0 || { echo "::error::no patches in $MISSION/patches"; exit 1; }
+          git -c user.name=ci -c user.email=ci@localhost am --3way "$GITHUB_WORKSPACE/$MISSION/patches"/*.patch
+          echo "applied $n patch(es):"; git log --oneline "${{ steps.pin.outputs.sha }}..HEAD"
+
+      - name: Cache LLVM release tarball + zstd
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/runner/halide-hip/llvm
+            /home/runner/halide-hip/deps
+          key: llvm-${{ env.LLVM_VER }}-linux-x64-zstd-1.5.7-v1
+
+      - name: Toolchain + configure + build libHalide (scripts/wsl-setup.sh)
+        run: |
+          # wsl-setup.sh: pip cmake/ninja, LLVM tarball (cached above), zstd, cmake configure, build target Halide
+          bash "$MISSION/scripts/wsl-setup.sh" "$ROOT/Halide" "$ROOT/build"
+          grep -E "WITH_AMDGPU|AMDGPU" "$ROOT/build/CMakeCache.txt" || true
+          test -f "$ROOT/build/src/libHalide.so" || { echo "::error::libHalide.so not built"; exit 1; }
+
+      - name: Build and run internal / ELF-validation tests
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          cd "$ROOT"
+          # Halide test names double as CMake target names; discover then build only those.
+          tests="$(ctest --test-dir build -N -R 'internal|amdgpu|hip' 2>/dev/null | grep -oE 'Test +#[0-9]+: +[A-Za-z0-9_]+' | awk '{print $NF}' | sort -u || true)"
+          if [ -z "$tests" ]; then
+            echo "::warning::no ctest entries match 'internal|amdgpu|hip' — the CodeGen_AMDGPU_Dev ELF-validation test (DESIGN.md §6 A.1) is not registered yet"
+            exit 0
+          fi
+          echo "matching tests:"; echo "$tests"
+          # shellcheck disable=SC2086
+          cmake --build build -j "$(nproc)" --target $tests
+          ctest --test-dir build -R 'internal|amdgpu|hip' --output-on-failure -j 4 --timeout 900
+
+      - name: compile-verify (smoke pipelines + apps, per arch)
+        env:
+          ARCHS: ${{ github.event.inputs.archs || 'gfx942 gfx1100 gfx1151 gfx1201' }}
+          SKIP_APPS: ${{ github.event.inputs.skip_apps || '0' }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          ROOT="$ROOT" BUILD="$ROOT/build" HALIDE_SRC="$ROOT/Halide" \
+          LLVM_BIN="$ROOT/llvm/LLVM-${LLVM_VER}-Linux-X64/bin" \
+          RESULTS="$GITHUB_WORKSPACE/$MISSION/results" \
+            bash "$MISSION/scripts/compile-verify.sh"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: halide-hip-results-${{ github.run_number }}
+          path: |
+            missions/001-halide-hip/results/
+            /home/runner/halide-hip/compile-verify/**/*.txt
+            /home/runner/halide-hip/compile-verify/**/*.log
+          if-no-files-found: warn
+          retention-days: 30
