@@ -1,4 +1,9 @@
-# amd-port-agent
+# HIP/ROCm Backend for Halide
+
+<p align="center">
+  <img src="docs/assets/mamdga-banner.webp" alt="MAMDGA banner" width="720"/>
+</p>
+
 
 > **MAMDGA context:** this is the new backend/compiler GPU porting repo: a native HIP/ROCm backend for Halide, the image-processing compiler used in production media pipelines including Photoshop-class workloads. The first mission packages patches, design docs, verification scripts, and an AMD/Halide upstream handoff brief.
 
